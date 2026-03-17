@@ -192,8 +192,8 @@ async function handleInsert(docId, params) {
   const marginLeftPt  = toPt(docStyle.marginLeft)         || 72;  // 1 inch デフォルト
   const marginRightPt = toPt(docStyle.marginRight)        || 72;
   const usableWidthPt = pageWidthPt - marginLeftPt - marginRightPt;
-  // コンテンツがページ幅を超える場合はスペーサー=1pt（左端揃え）、収まる場合は右端揃え
-  const spacerWidthPt = Math.max(1, usableWidthPt - contentWidthPt);
+  // コンテンツがページ幅を超える場合はスペーサー=5pt（Google Docs最小値）、収まる場合は右端揃え
+  const spacerWidthPt = Math.max(5, usableWidthPt - contentWidthPt);
 
   // スペーサー列は常に追加（右揃え用）
   const totalCols = numCols + 1;
@@ -218,7 +218,7 @@ async function handleInsert(docId, params) {
   // ── STEP 4a: 列幅を設定 ──────────────────────────────────────
   // スペーサー列（col 0）: FIXED_WIDTH = spacerWidthPt（ページ幅から逆算）
   //   ページ幅 - マージン - コンテンツ列幅合計 = スペーサー幅
-  //   → コンテンツをページ右端に揃える。超過時は1ptにして左端揃え。
+  //   → コンテンツをページ右端に揃える。超過時は5pt（Google Docs最小値）にして左端揃え。
   // コンテンツ列（col 1〜）: FIXED_WIDTH = fSize + cellPadH*2
   const colWidthReqs = [{
     updateTableColumnProperties: {
@@ -262,7 +262,6 @@ async function handleInsert(docId, params) {
   }
 
   // 行1: メタデータ（col1=最初のコンテンツ列に格納）
-  // ※ col0 は多列時に極端に狭くなる場合があるため
   const metaJson    = JSON.stringify({ originalText: text, charsPerLine: cpLine, fontSize: fSize, fontFamily, lineSpacingPct: lSpacing, colGapPt: colGap });
   const metaCell    = newTable.tableRows[1].tableCells[1];
   const metaFirstEl = metaCell.content?.[0]?.paragraph?.elements?.[0];
@@ -337,7 +336,6 @@ async function handleInsert(docId, params) {
           const isTrailing = pi === lastParaIdx; // 末尾の空段落
 
           // 禁則処理で文字が増えた列は lineSpacing を比例縮小して高さを揃える
-          // 例: charsPerLine=20, lSpacing=70, chunkLen=21 → 70 * 20/21 ≈ 67
           const lineSpacing = chunkLen > cpLine
             ? Math.round(cpLine * lSpacing / chunkLen)
             : lSpacing;
@@ -378,11 +376,9 @@ async function handleInsert(docId, params) {
 
       } else if (row === 1) {
         // ── メタデータ行：フォントサイズ1pt・白文字・行間最小化で不可視化 ──
-        // row1 の高さを最小限に抑えてページ増加を防ぐ
         for (const contentEl of tableCell.content || []) {
           if (!contentEl.paragraph) continue;
 
-          // 段落スタイル：行間1%・前後スペースゼロで高さを最小化
           styleReqs.push({
             updateParagraphStyle: {
               range: { startIndex: contentEl.startIndex, endIndex: contentEl.endIndex },
@@ -415,25 +411,18 @@ async function handleInsert(docId, params) {
 
   await batchUpdate(token, docId, styleReqs);
 
-  // 均等割付ボタン用に tableStartIndex と列数を返す
   return { success: true, tableStartIndex, numCols };
 }
 
 // ─── 均等割付：指定列の字間を再計算して適用 ──────────────────────────
-//
-// chunkIndices: 均等割付する列のチャンクインデックス（0=右端列, 1=その左…）
-//
-// resetMode=true のとき spaceAbove をすべて 0 にリセット（均等割付解除）
 async function applyColumnJustify(docId, tableStartIndex, chunkIndices, resetMode = false) {
   const token = await getToken();
   const doc   = await docsGet(token, docId);
 
-  // tableStartIndex が一致するテーブルを検索
   const tableEl = doc.body.content.find(el => el.table && el.startIndex === tableStartIndex);
   if (!tableEl) throw new Error('指定されたテーブルが見つかりませんでした');
   const table = tableEl.table;
 
-  // メタデータを最終行から取得（col1 優先、見つからなければ col0 にフォールバック）
   const lastRow   = table.tableRows[table.tableRows.length - 1];
   let cellText = '';
   const metaCandidates = [lastRow.tableCells[1], lastRow.tableCells[0]].filter(Boolean);
@@ -455,12 +444,10 @@ async function applyColumnJustify(docId, tableStartIndex, chunkIndices, resetMod
   const { originalText, charsPerLine, fontSize: fSizeRaw } = meta;
   const fSize = parseFloat(fSizeRaw);
 
-  // チャンク再構築
   const chunks  = buildChunks(originalText, parseInt(charsPerLine));
   const numCols = chunks.length;
   const maxChars = Math.max(...chunks.map(c => c.length));
 
-  // スペーサー列の有無を判定
   const totalDisplayCols = table.tableRows[0].tableCells.length;
   const hasSpacerCol     = totalDisplayCols > numCols;
 
@@ -469,14 +456,12 @@ async function applyColumnJustify(docId, tableStartIndex, chunkIndices, resetMod
   for (const chunkIdx of chunkIndices) {
     if (chunkIdx < 0 || chunkIdx >= numCols) continue;
 
-    // chunkIdx → 表示列インデックス変換
     const contentColIdx = numCols - 1 - chunkIdx;
     const displayCol    = contentColIdx + (hasSpacerCol ? 1 : 0);
 
     const chunk    = chunks[chunkIdx];
     const chunkLen = chunk.length;
 
-    // 均等割付の字間計算（resetMode=true のときは常に 0）
     const extraSpace = resetMode ? 0 : (maxChars - chunkLen) * fSize;
     const numGaps    = Math.max(chunkLen - 1, 1);
     const gapBetween = (!resetMode && chunkLen > 1) ? extraSpace / numGaps : 0;
@@ -523,7 +508,6 @@ async function loadFvdocTables(docId) {
     const lastRow = table.tableRows[table.tableRows.length - 1];
     if (!lastRow) continue;
 
-    // col1（新形式）→ col0（旧形式）の順でメタデータを探す
     let cellText = '';
     const candidates = [lastRow.tableCells[1], lastRow.tableCells[0]].filter(Boolean);
     for (const cell of candidates) {
