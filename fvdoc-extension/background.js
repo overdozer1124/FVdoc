@@ -404,20 +404,39 @@ async function handleInsert(docId, params) {
   const marginBottomPt = toPt(docStyle.marginBottom)       || 72;
   const usableHeightPt = pageHeightPt - marginTopPt - marginBottomPt;
 
+  // ページ幅（水平分割の判定に使用）
+  const pageWidthPt   = toPt(docStyle.pageSize?.width)  || 595;
+  const marginLeftPt  = toPt(docStyle.marginLeft)        || 72;
+  const marginRightPt = toPt(docStyle.marginRight)       || 72;
+  const usableWidthPt = pageWidthPt - marginLeftPt - marginRightPt;
+
   // 列間(colGap)を反映: 各セル左右パディング = 1 + 列間/2 → 隣接列の間隔 = 列間
   const cellPadH   = 1 + colGap / 2;
   const colWidthPt = fSize + cellPadH * 2; // 1列の幅 = フォント幅 + 左右パディング（列間込み）
 
   // 1ページに収まる行数（縦書きセル内の「行」＝1文字＝1段落の高さ）
-  // ※ 水平方向（列数）の分割は行わず、すべての列を1ページに収める
-  //   EVENLY_DISTRIBUTED スペーサーがページ幅に合わせて自動調整するため
   const lineHeightPt    = fSize * (lSpacing / 100);
   const maxLinesPerPage = Math.max(1, Math.floor(usableHeightPt / lineHeightPt));
 
-  // すべてのチャンクを1グループ（水平分割なし）
-  // 改ページが必要な場合は行数（高さ）に基づいてのみ分割する
-  chunks._fontFamily = fontFamily;
-  const pageChunkGroups = [chunks];
+  // 水平方向の列数ページ分割
+  //   列間が小さい場合: 列幅合計がページ幅を多少超えてもDocsがスケーリングして1ページに収める
+  //   列間が大きい場合: 超過量が大きいためDocsがスケーリングできずはみ出す → 分割が必要
+  //
+  //   判定基準: 列幅合計 が ページ幅 × SCALE_TOLERANCE を超えたら分割
+  //   SCALE_TOLERANCE=1.5 → 50%超過までは許容（Docsのスケーリングに任せる）
+  const SCALE_TOLERANCE  = 1.5;
+  const totalContentWidth = chunks.length * colWidthPt;
+  const columnsPerPage   = totalContentWidth > usableWidthPt * SCALE_TOLERANCE
+    ? Math.max(1, Math.floor(usableWidthPt / colWidthPt)) // 超過 → 分割
+    : chunks.length;                                       // 許容範囲内 → 全列を1ページに
+
+  // チャンクをページ単位に分割（超過の場合のみ複数グループ）
+  const pageChunkGroups = [];
+  for (let i = 0; i < chunks.length; i += columnsPerPage) {
+    const group = chunks.slice(i, i + columnsPerPage);
+    group._fontFamily = fontFamily;
+    pageChunkGroups.push(group);
+  }
 
   const metaJson = JSON.stringify({
     originalText: text, charsPerLine: cpLine, fontSize: fSize,
