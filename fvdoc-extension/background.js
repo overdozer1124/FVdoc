@@ -159,26 +159,24 @@ function buildChunks(text, charsPerLine) {
 // useEndOfSegment: true のとき文書末尾（改ページの後）に挿入（2ページ目以降で謎の空白を防ぐ）
 async function insertPageTable(token, docId, pageChunks, {
   cpLine, fSize, lSpacing, colGap, cellPadH, colWidthPt,
-  spacerWidthPt, isFirstPage, metaJson
+  isFirstPage, metaJson
 }) {
   const numPageCols   = pageChunks.length;
   const totalPageCols = numPageCols + 1; // col0 = スペーサー（左端・右寄せ用）
 
-  const spacerMagnitude = Math.round(spacerWidthPt);
-  const colMagnitude    = Math.round(colWidthPt);
+  const colMagnitude = Math.round(colWidthPt);
 
   function makeColWidthReqs(tableStartIdx) {
+    // col0: EVENLY_DISTRIBUTED → ページ幅 - コンテンツ列幅合計 = 残り幅を自動吸収して右端揃え
     const reqs = [{
       updateTableColumnProperties: {
         tableStartLocation: { index: tableStartIdx },
         columnIndices: [0],
-        tableColumnProperties: {
-          widthType: 'FIXED_WIDTH',
-          width: { magnitude: spacerMagnitude, unit: 'PT' }
-        },
-        fields: 'width,widthType'
+        tableColumnProperties: { widthType: 'EVENLY_DISTRIBUTED' },
+        fields: 'widthType'
       }
     }];
+    // col1〜: FIXED_WIDTH = fSize + 左右パディング（列間込み）
     for (let col = 1; col < totalPageCols; col++) {
       reqs.push({
         updateTableColumnProperties: {
@@ -451,11 +449,6 @@ async function handleInsert(docId, params) {
       }
     }
 
-    // スペーサー＝左端の列を広くして表を右寄せに見せる
-    // コンテンツ幅は「列間」込みの1列幅×列数（列間を大きくするとコンテンツ幅が増え、スペーサーは減る）
-    const contentWidthPt = numPageCols * colWidthPt; // colWidthPt = fSize + 2*cellPadH, cellPadH = 1 + colGap/2
-    const spacerWidthPt  = Math.max(5, usableWidthPt - contentWidthPt);
-
     for (let sliceIdx = 0; sliceIdx < numHeightSlices; sliceIdx++) {
       const lineStart = sliceIdx * maxLinesPerPage;
       const lineEnd   = (sliceIdx === numHeightSlices - 1)
@@ -484,7 +477,6 @@ async function handleInsert(docId, params) {
 
       const tableStartIndex = await insertPageTable(token, docId, slicedChunks, {
         cpLine, fSize, lSpacing, colGap, cellPadH, colWidthPt,
-        spacerWidthPt,
         isFirstPage: isFirstTable,
         metaJson: isFirstTable ? metaJson : null
       });
