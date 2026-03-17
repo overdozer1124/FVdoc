@@ -250,9 +250,11 @@ async function handleInsert(docId, params) {
     insertions.push({ index: firstEl.startIndex, text: cellText });
   }
 
-  // 行1: メタデータ（col0 に格納）
+  // 行1: メタデータ（col1=最初のコンテンツ列に格納）
+  // ※ col0 は EVENLY_DISTRIBUTED スペーサーで多列時に極端に狭くなるため
+  //    折り返しが大量発生し row1 が巨大化してページが増える問題を避ける
   const metaJson    = JSON.stringify({ originalText: text, charsPerLine: cpLine, fontSize: fSize, fontFamily, lineSpacingPct: lSpacing, colGapPt: colGap });
-  const metaCell    = newTable.tableRows[1].tableCells[0];
+  const metaCell    = newTable.tableRows[1].tableCells[1];
   const metaFirstEl = metaCell.content?.[0]?.paragraph?.elements?.[0];
   if (metaFirstEl) {
     insertions.push({ index: metaFirstEl.startIndex, text: FVDOC_MARKER + metaJson });
@@ -365,8 +367,24 @@ async function handleInsert(docId, params) {
         }
 
       } else if (row === 1) {
-        // ── メタデータ行：フォントサイズ1pt・白文字で不可視化 ──
+        // ── メタデータ行：フォントサイズ1pt・白文字・行間最小化で不可視化 ──
+        // row1 の高さを最小限に抑えてページ増加を防ぐ
         for (const contentEl of tableCell.content || []) {
+          if (!contentEl.paragraph) continue;
+
+          // 段落スタイル：行間1%・前後スペースゼロで高さを最小化
+          styleReqs.push({
+            updateParagraphStyle: {
+              range: { startIndex: contentEl.startIndex, endIndex: contentEl.endIndex },
+              paragraphStyle: {
+                lineSpacing:  1,
+                spaceAbove:   { magnitude: 0, unit: 'PT' },
+                spaceBelow:   { magnitude: 0, unit: 'PT' }
+              },
+              fields: 'lineSpacing,spaceAbove,spaceBelow'
+            }
+          });
+
           for (const pe of contentEl.paragraph?.elements || []) {
             if (!pe.textRun) continue;
             styleReqs.push({
@@ -405,13 +423,19 @@ async function applyColumnJustify(docId, tableStartIndex, chunkIndices, resetMod
   if (!tableEl) throw new Error('指定されたテーブルが見つかりませんでした');
   const table = tableEl.table;
 
-  // メタデータを最終行 col0 から取得
+  // メタデータを最終行から取得（col1 優先、見つからなければ col0 にフォールバック）
   const lastRow   = table.tableRows[table.tableRows.length - 1];
   let cellText = '';
-  for (const contentEl of lastRow.tableCells[0].content || []) {
-    for (const pe of contentEl.paragraph?.elements || []) {
-      if (pe.textRun) cellText += pe.textRun.content;
+  // col1（新形式）を先に確認、なければ col0（旧形式）もチェック
+  const metaCandidates = [lastRow.tableCells[1], lastRow.tableCells[0]].filter(Boolean);
+  for (const candidate of metaCandidates) {
+    let t = '';
+    for (const contentEl of candidate.content || []) {
+      for (const pe of contentEl.paragraph?.elements || []) {
+        if (pe.textRun) t += pe.textRun.content;
+      }
     }
+    if (t.includes(FVDOC_MARKER)) { cellText = t; break; }
   }
   if (!cellText.includes(FVDOC_MARKER)) throw new Error('FVdocメタデータが見つかりません（このテーブルはFVdoc形式ではありません）');
 
@@ -493,16 +517,20 @@ async function loadFvdocTables(docId) {
     const table   = el.table;
     const lastRow = table.tableRows[table.tableRows.length - 1];
     if (!lastRow) continue;
-    const firstCell = lastRow.tableCells[0];
-    if (!firstCell) continue;
 
+    // col1（新形式）→ col0（旧形式）の順でメタデータを探す
     let cellText = '';
-    for (const contentEl of firstCell.content || []) {
-      if (contentEl.paragraph) {
-        for (const pe of contentEl.paragraph.elements || []) {
-          if (pe.textRun) cellText += pe.textRun.content;
+    const candidates = [lastRow.tableCells[1], lastRow.tableCells[0]].filter(Boolean);
+    for (const cell of candidates) {
+      let t = '';
+      for (const contentEl of cell.content || []) {
+        if (contentEl.paragraph) {
+          for (const pe of contentEl.paragraph.elements || []) {
+            if (pe.textRun) t += pe.textRun.content;
+          }
         }
       }
+      if (t.includes(FVDOC_MARKER)) { cellText = t; break; }
     }
 
     if (cellText.includes(FVDOC_MARKER)) {
