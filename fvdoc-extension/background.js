@@ -399,34 +399,25 @@ async function handleInsert(docId, params) {
   // ── ページ寸法とスペーサー計算 ────────────────────────────────
   const doc            = await docsGet(token, docId);
   const docStyle       = doc.documentStyle || {};
-  const pageWidthPt    = toPt(docStyle.pageSize?.width)   || 595;
   const pageHeightPt   = toPt(docStyle.pageSize?.height)  || 842;
-  const marginLeftPt   = toPt(docStyle.marginLeft)         || 72;
-  const marginRightPt  = toPt(docStyle.marginRight)        || 72;
-  const marginTopPt    = toPt(docStyle.marginTop)         || 72;
+  const marginTopPt    = toPt(docStyle.marginTop)          || 72;
   const marginBottomPt = toPt(docStyle.marginBottom)       || 72;
-  const usableWidthPt  = pageWidthPt - marginLeftPt - marginRightPt;
   const usableHeightPt = pageHeightPt - marginTopPt - marginBottomPt;
 
   // 列間(colGap)を反映: 各セル左右パディング = 1 + 列間/2 → 隣接列の間隔 = 列間
   const cellPadH   = 1 + colGap / 2;
   const colWidthPt = fSize + cellPadH * 2; // 1列の幅 = フォント幅 + 左右パディング（列間込み）
 
-  // 1ページに収まる列数（スペーサー最小5ptを確保）。列間が大きいと1ページあたりの列数は減る
-  const columnsPerPage = Math.max(1, Math.floor((usableWidthPt - 5) / colWidthPt));
-
   // 1ページに収まる行数（縦書きセル内の「行」＝1文字＝1段落の高さ）
-  const lineHeightPt   = fSize * (lSpacing / 100);
+  // ※ 水平方向（列数）の分割は行わず、すべての列を1ページに収める
+  //   EVENLY_DISTRIBUTED スペーサーがページ幅に合わせて自動調整するため
+  const lineHeightPt    = fSize * (lSpacing / 100);
   const maxLinesPerPage = Math.max(1, Math.floor(usableHeightPt / lineHeightPt));
 
-  // チャンクをページ単位に分割
-  // chunks[0] = 右端列（最初に読む）→ページ1の右端に配置
-  const pageChunkGroups = [];
-  for (let i = 0; i < chunks.length; i += columnsPerPage) {
-    const group = chunks.slice(i, i + columnsPerPage);
-    group._fontFamily = fontFamily; // フォント情報を添付
-    pageChunkGroups.push(group);
-  }
+  // すべてのチャンクを1グループ（水平分割なし）
+  // 改ページが必要な場合は行数（高さ）に基づいてのみ分割する
+  chunks._fontFamily = fontFamily;
+  const pageChunkGroups = [chunks];
 
   const metaJson = JSON.stringify({
     originalText: text, charsPerLine: cpLine, fontSize: fSize,
