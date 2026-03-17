@@ -185,7 +185,17 @@ async function handleInsert(docId, params) {
   const colWidthPt = fSize + cellPadH * 2;         // 列幅合計
   const contentWidthPt = colWidthPt * numCols;
 
-  // スペーサー列は常に追加（右揃え用。幅は STEP3 で実テーブル幅を読んで決定）
+  // ページ幅・マージンからスペーサー幅を正確に計算
+  // EVENLY_DISTRIBUTED は多列時に右へのはみ出しが発生するため FIXED_WIDTH に変更
+  const docStyle      = doc.documentStyle || {};
+  const pageWidthPt   = toPt(docStyle.pageSize?.width)   || 595; // A4 デフォルト
+  const marginLeftPt  = toPt(docStyle.marginLeft)         || 72;  // 1 inch デフォルト
+  const marginRightPt = toPt(docStyle.marginRight)        || 72;
+  const usableWidthPt = pageWidthPt - marginLeftPt - marginRightPt;
+  // コンテンツがページ幅を超える場合はスペーサー=1pt（左端揃え）、収まる場合は右端揃え
+  const spacerWidthPt = Math.max(1, usableWidthPt - contentWidthPt);
+
+  // スペーサー列は常に追加（右揃え用）
   const totalCols = numCols + 1;
 
   // ── STEP 2: 空テーブルを挿入（スペーサー列込み） ─────────────
@@ -198,8 +208,6 @@ async function handleInsert(docId, params) {
   }]);
 
   // ── STEP 3: 更新済みドキュメントを取得 ───────────────────────
-  // テーブルの実際の幅を tableColumnProperties から読み取ることで
-  // ページ寸法の推定誤差を排除する
   const updatedDoc    = await docsGet(token, docId);
   const tableElements = updatedDoc.body.content.filter(el => el.table);
   if (!tableElements.length) throw new Error('テーブルの挿入に失敗しました');
@@ -208,16 +216,19 @@ async function handleInsert(docId, params) {
   const newTableStart = newTableEl.startIndex;
 
   // ── STEP 4a: 列幅を設定 ──────────────────────────────────────
-  // スペーサー列（col 0）: EVENLY_DISTRIBUTED
-  //   → テーブル幅 - 全コンテンツ列幅 = 残り全部をスペーサーに自動割当て
-  //   → 幅の計算・推定が不要、最小幅制約の影響も受けない
-  // コンテンツ列（col 1〜）: FIXED_WIDTH = fSize + 2pt
+  // スペーサー列（col 0）: FIXED_WIDTH = spacerWidthPt（ページ幅から逆算）
+  //   ページ幅 - マージン - コンテンツ列幅合計 = スペーサー幅
+  //   → コンテンツをページ右端に揃える。超過時は1ptにして左端揃え。
+  // コンテンツ列（col 1〜）: FIXED_WIDTH = fSize + cellPadH*2
   const colWidthReqs = [{
     updateTableColumnProperties: {
       tableStartLocation: { index: newTableStart },
       columnIndices: [0],
-      tableColumnProperties: { widthType: 'EVENLY_DISTRIBUTED' },
-      fields: 'widthType'
+      tableColumnProperties: {
+        widthType: 'FIXED_WIDTH',
+        width: { magnitude: spacerWidthPt, unit: 'PT' }
+      },
+      fields: 'widthType,width'
     }
   }];
   for (let col = 1; col < totalCols; col++) {
@@ -251,8 +262,7 @@ async function handleInsert(docId, params) {
   }
 
   // 行1: メタデータ（col1=最初のコンテンツ列に格納）
-  // ※ col0 は EVENLY_DISTRIBUTED スペーサーで多列時に極端に狭くなるため
-  //    折り返しが大量発生し row1 が巨大化してページが増える問題を避ける
+  // ※ col0 は多列時に極端に狭くなる場合があるため
   const metaJson    = JSON.stringify({ originalText: text, charsPerLine: cpLine, fontSize: fSize, fontFamily, lineSpacingPct: lSpacing, colGapPt: colGap });
   const metaCell    = newTable.tableRows[1].tableCells[1];
   const metaFirstEl = metaCell.content?.[0]?.paragraph?.elements?.[0];
@@ -272,7 +282,7 @@ async function handleInsert(docId, params) {
   const styledTable   = styledTableEl.table;
   const tableStartIndex = styledTableEl.startIndex;
 
-  // ── セル・テキストスタイル（列幅は STEP2 で設定済み）────────
+  // ── セル・テキストスタイル（列幅は STEP4a で設定済み）────────
   const styleReqs = [];
   const white      = { color: { rgbColor: { red: 1, green: 1, blue: 1 } } };
   const whiteBorder = { color: white, width: { magnitude: 1, unit: 'PT' }, dashStyle: 'SOLID' };
@@ -426,7 +436,6 @@ async function applyColumnJustify(docId, tableStartIndex, chunkIndices, resetMod
   // メタデータを最終行から取得（col1 優先、見つからなければ col0 にフォールバック）
   const lastRow   = table.tableRows[table.tableRows.length - 1];
   let cellText = '';
-  // col1（新形式）を先に確認、なければ col0（旧形式）もチェック
   const metaCandidates = [lastRow.tableCells[1], lastRow.tableCells[0]].filter(Boolean);
   for (const candidate of metaCandidates) {
     let t = '';
@@ -461,7 +470,6 @@ async function applyColumnJustify(docId, tableStartIndex, chunkIndices, resetMod
     if (chunkIdx < 0 || chunkIdx >= numCols) continue;
 
     // chunkIdx → 表示列インデックス変換
-    //   chunkIdx 0 = 右端列 → contentColIdx = numCols-1 → displayCol = numCols-1 + (spacer?1:0)
     const contentColIdx = numCols - 1 - chunkIdx;
     const displayCol    = contentColIdx + (hasSpacerCol ? 1 : 0);
 
@@ -469,8 +477,6 @@ async function applyColumnJustify(docId, tableStartIndex, chunkIndices, resetMod
     const chunkLen = chunk.length;
 
     // 均等割付の字間計算（resetMode=true のときは常に 0）
-    //   totalHeight = maxChars * fSize  (最長列の総高さ)
-    //   この列の文字が chunkLen 個 → 字間 = (maxChars - chunkLen) * fSize / (chunkLen - 1)
     const extraSpace = resetMode ? 0 : (maxChars - chunkLen) * fSize;
     const numGaps    = Math.max(chunkLen - 1, 1);
     const gapBetween = (!resetMode && chunkLen > 1) ? extraSpace / numGaps : 0;
@@ -485,7 +491,6 @@ async function applyColumnJustify(docId, tableStartIndex, chunkIndices, resetMod
       if (!contentEl.paragraph) continue;
       const isTrailing = pi === lastParaIdx;
 
-      // 最初の文字: spaceAbove=0、2文字目以降: gapBetween
       const spaceAbovePt = (!isTrailing && charIdx > 0) ? gapBetween : 0;
 
       styleReqs.push({
