@@ -152,20 +152,55 @@ function buildChunks(text, charsPerLine) {
 }
 
 // ─── 1ページ分のテーブルを挿入・設定する ─────────────────────────
-// pageChunks : このページに配置するチャンク配列（chunks[0]=右端）
-// isFirstPage: true のときメタデータをcol1に挿入する
+// pageChunks : このページに配置するチャンク配列（chunks[0]=右端＝最初に読む列）
+// 列構成（左→右）: col0=スペーサー | col1=左端の列(最後に読む) … col numPageCols=右端の列(最初に読む)
+// 縦書きは右から左へ読むので、画面では右端が col numPageCols = chunks[0]
+// isFirstPage: true のときメタデータを col1 に挿入する
+// useEndOfSegment: true のとき文書末尾（改ページの後）に挿入（2ページ目以降で謎の空白を防ぐ）
 async function insertPageTable(token, docId, pageChunks, {
   cpLine, fSize, lSpacing, colGap, cellPadH, colWidthPt,
   spacerWidthPt, isFirstPage, metaJson
 }) {
-  const numPageCols  = pageChunks.length;
-  const totalPageCols = numPageCols + 1; // col0 = スペーサー
+  const numPageCols   = pageChunks.length;
+  const totalPageCols = numPageCols + 1; // col0 = スペーサー（左端・右寄せ用）
 
-  // ── 現在の挿入位置を取得 ───────────────────────────────────────
-  const currentDoc  = await docsGet(token, docId);
-  const insertAt    = currentDoc.body.content[currentDoc.body.content.length - 1].startIndex;
+  const spacerMagnitude = Math.round(spacerWidthPt);
+  const colMagnitude    = Math.round(colWidthPt);
 
-  // ── テーブル挿入 ────────────────────────────────────────────────
+  function makeColWidthReqs(tableStartIdx) {
+    const reqs = [{
+      updateTableColumnProperties: {
+        tableStartLocation: { index: tableStartIdx },
+        columnIndices: [0],
+        tableColumnProperties: {
+          widthType: 'FIXED_WIDTH',
+          width: { magnitude: spacerMagnitude, unit: 'PT' }
+        },
+        fields: 'width,widthType'
+      }
+    }];
+    for (let col = 1; col < totalPageCols; col++) {
+      reqs.push({
+        updateTableColumnProperties: {
+          tableStartLocation: { index: tableStartIdx },
+          columnIndices: [col],
+          tableColumnProperties: {
+            widthType: 'FIXED_WIDTH',
+            width: { magnitude: colMagnitude, unit: 'PT' }
+          },
+          fields: 'width,widthType'
+        }
+      });
+    }
+    return reqs;
+  }
+
+  // ── 挿入位置を取得（endIndex - 1 = ドキュメント末尾の有効な最後のインデックス）
+  const currentDoc = await docsGet(token, docId);
+  const lastEl     = currentDoc.body.content[currentDoc.body.content.length - 1];
+  const insertAt   = lastEl.endIndex - 1;
+
+  // ── テーブル挿入
   await batchUpdate(token, docId, [{
     insertTable: {
       rows: 2,
@@ -174,48 +209,22 @@ async function insertPageTable(token, docId, pageChunks, {
     }
   }]);
 
-  // ── テーブル情報取得 ────────────────────────────────────────────
+  // ── テーブル情報取得（実際の startIndex を使用）
   const updatedDoc    = await docsGet(token, docId);
   const tableElements = updatedDoc.body.content.filter(el => el.table);
   const newTableEl    = tableElements[tableElements.length - 1];
   const newTable      = newTableEl.table;
   const newTableStart = newTableEl.startIndex;
 
-  // ── 列幅設定 ────────────────────────────────────────────────────
-  // col0: スペーサー（ページ幅 − コンテンツ列幅合計）で右端揃え
-  // col1〜: FIXED_WIDTH = fSize + cellPadH * 2
-  const colWidthReqs = [{
-    updateTableColumnProperties: {
-      tableStartLocation: { index: newTableStart },
-      columnIndices: [0],
-      tableColumnProperties: {
-        widthType: 'FIXED_WIDTH',
-        width: { magnitude: spacerWidthPt, unit: 'PT' }
-      },
-      fields: 'widthType,width'
-    }
-  }];
-  for (let col = 1; col < totalPageCols; col++) {
-    colWidthReqs.push({
-      updateTableColumnProperties: {
-        tableStartLocation: { index: newTableStart },
-        columnIndices: [col],
-        tableColumnProperties: {
-          widthType: 'FIXED_WIDTH',
-          width: { magnitude: colWidthPt, unit: 'PT' }
-        },
-        fields: 'widthType,width'
-      }
-    });
-  }
-  await batchUpdate(token, docId, colWidthReqs);
+  // ── 列幅設定
+  await batchUpdate(token, docId, makeColWidthReqs(newTableStart));
 
-  // ── テキスト挿入（インデックス降順） ────────────────────────────
+  // ── テキスト挿入（col1=左端列 chunks[n-1] … col numPageCols=右端列 chunks[0]、右から左へ読む） ──
   const insertions = [];
 
   for (let col = 1; col < totalPageCols; col++) {
     const contentColIdx = col - 1;
-    const pageChunkIdx  = numPageCols - 1 - contentColIdx; // 右端 = pageChunks[0]
+    const pageChunkIdx  = numPageCols - 1 - contentColIdx; // 右端=chunks[0] → 最後の列に
     const chunk         = pageChunks[pageChunkIdx];
     const cellText      = chunk.split('').join('\n');
 
@@ -225,7 +234,7 @@ async function insertPageTable(token, docId, pageChunks, {
     insertions.push({ index: firstEl.startIndex, text: cellText });
   }
 
-  // メタデータは最初のページの col1 にのみ格納
+  // メタデータは最初のページの col1（2行目）にのみ格納
   if (isFirstPage && metaJson) {
     const metaCell    = newTable.tableRows[1].tableCells[1];
     const metaFirstEl = metaCell.content?.[0]?.paragraph?.elements?.[0];
@@ -242,8 +251,8 @@ async function insertPageTable(token, docId, pageChunks, {
   // ── スタイル適用 ────────────────────────────────────────────────
   const styledDoc     = await docsGet(token, docId);
   const styledTables  = styledDoc.body.content.filter(el => el.table);
-  const styledTableEl = styledTables[styledTables.length - 1];
-  const styledTable   = styledTableEl.table;
+  const styledTableEl  = styledTables[styledTables.length - 1];
+  const styledTable    = styledTableEl.table;
   const tableStartIndex = styledTableEl.startIndex;
 
   const styleReqs  = [];
@@ -370,6 +379,10 @@ async function insertPageTable(token, docId, pageChunks, {
   }
 
   await batchUpdate(token, docId, styleReqs);
+
+  // スタイル適用後に全列の幅を再適用（Docs が列幅を上書きすることがあるため、スペーサー含め確実に効かせる）
+  await batchUpdate(token, docId, makeColWidthReqs(tableStartIndex));
+
   return tableStartIndex;
 }
 
@@ -386,18 +399,27 @@ async function handleInsert(docId, params) {
   if (!chunks.length) throw new Error('テキストがありません');
 
   // ── ページ寸法とスペーサー計算 ────────────────────────────────
-  const doc           = await docsGet(token, docId);
-  const docStyle      = doc.documentStyle || {};
-  const pageWidthPt   = toPt(docStyle.pageSize?.width)   || 595;
-  const marginLeftPt  = toPt(docStyle.marginLeft)         || 72;
-  const marginRightPt = toPt(docStyle.marginRight)        || 72;
-  const usableWidthPt = pageWidthPt - marginLeftPt - marginRightPt;
+  const doc            = await docsGet(token, docId);
+  const docStyle       = doc.documentStyle || {};
+  const pageWidthPt    = toPt(docStyle.pageSize?.width)   || 595;
+  const pageHeightPt   = toPt(docStyle.pageSize?.height)  || 842;
+  const marginLeftPt   = toPt(docStyle.marginLeft)         || 72;
+  const marginRightPt  = toPt(docStyle.marginRight)        || 72;
+  const marginTopPt    = toPt(docStyle.marginTop)         || 72;
+  const marginBottomPt = toPt(docStyle.marginBottom)       || 72;
+  const usableWidthPt  = pageWidthPt - marginLeftPt - marginRightPt;
+  const usableHeightPt = pageHeightPt - marginTopPt - marginBottomPt;
 
+  // 列間(colGap)を反映: 各セル左右パディング = 1 + 列間/2 → 隣接列の間隔 = 列間
   const cellPadH   = 1 + colGap / 2;
-  const colWidthPt = fSize + cellPadH * 2;
+  const colWidthPt = fSize + cellPadH * 2; // 1列の幅 = フォント幅 + 左右パディング（列間込み）
 
-  // 1ページに収まる列数（スペーサー最小5ptを確保）
+  // 1ページに収まる列数（スペーサー最小5ptを確保）。列間が大きいと1ページあたりの列数は減る
   const columnsPerPage = Math.max(1, Math.floor((usableWidthPt - 5) / colWidthPt));
+
+  // 1ページに収まる行数（縦書きセル内の「行」＝1文字＝1段落の高さ）
+  const lineHeightPt   = fSize * (lSpacing / 100);
+  const maxLinesPerPage = Math.max(1, Math.floor(usableHeightPt / lineHeightPt));
 
   // チャンクをページ単位に分割
   // chunks[0] = 右端列（最初に読む）→ページ1の右端に配置
@@ -416,30 +438,59 @@ async function handleInsert(docId, params) {
   let firstTableStartIndex = null;
 
   for (let pageIdx = 0; pageIdx < pageChunkGroups.length; pageIdx++) {
-    const pageChunks    = pageChunkGroups[pageIdx];
-    const numPageCols   = pageChunks.length;
-    const spacerWidthPt = Math.max(5, usableWidthPt - numPageCols * colWidthPt);
+    const pageChunks  = pageChunkGroups[pageIdx];
+    const numPageCols = pageChunks.length;
+    const maxChunkLen = Math.max(...pageChunks.map(c => c.length), 1);
+    let numHeightSlices = Math.ceil(maxChunkLen / maxLinesPerPage);
 
-    // 2ページ目以降：セクションブレーク（次ページ）を挿入
-    if (pageIdx > 0) {
-      const d       = await docsGet(token, docId);
-      const breakAt = d.body.content[d.body.content.length - 1].startIndex;
-      await batchUpdate(token, docId, [{
-        insertSectionBreak: {
-          location:    { index: breakAt },
-          sectionType: 'NEXT_PAGE'
-        }
-      }]);
+    // 最後のスライスが極端に短い場合は前のテーブルに含め、空白ページを防ぐ
+    if (numHeightSlices > 1) {
+      const lastSliceLines = maxChunkLen - (numHeightSlices - 1) * maxLinesPerPage;
+      if (lastSliceLines < maxLinesPerPage * 0.25) {
+        numHeightSlices -= 1;
+      }
     }
 
-    const tableStartIndex = await insertPageTable(token, docId, pageChunks, {
-      cpLine, fSize, lSpacing, colGap, cellPadH, colWidthPt,
-      spacerWidthPt,
-      isFirstPage: pageIdx === 0,
-      metaJson: pageIdx === 0 ? metaJson : null
-    });
+    // スペーサー＝左端の列を広くして表を右寄せに見せる
+    // コンテンツ幅は「列間」込みの1列幅×列数（列間を大きくするとコンテンツ幅が増え、スペーサーは減る）
+    const contentWidthPt = numPageCols * colWidthPt; // colWidthPt = fSize + 2*cellPadH, cellPadH = 1 + colGap/2
+    const spacerWidthPt  = Math.max(5, usableWidthPt - contentWidthPt);
 
-    if (pageIdx === 0) firstTableStartIndex = tableStartIndex;
+    for (let sliceIdx = 0; sliceIdx < numHeightSlices; sliceIdx++) {
+      const lineStart = sliceIdx * maxLinesPerPage;
+      const lineEnd   = (sliceIdx === numHeightSlices - 1)
+        ? maxChunkLen
+        : Math.min(lineStart + maxLinesPerPage, maxChunkLen);
+      const slicedChunks = pageChunks.map(chunk =>
+        chunk.substring(lineStart, Math.min(lineEnd, chunk.length))
+      );
+      const hasContent = slicedChunks.some(c => c.length > 0);
+      if (!hasContent) continue;
+
+      const isFirstTable = pageIdx === 0 && sliceIdx === 0;
+
+      if (pageIdx > 0 || sliceIdx > 0) {
+        const dBreak   = await docsGet(token, docId);
+        const breakAt  = dBreak.body.content[dBreak.body.content.length - 1].endIndex - 1;
+        await batchUpdate(token, docId, [{
+          insertSectionBreak: {
+            location:    { index: breakAt },
+            sectionType: 'NEXT_PAGE'
+          }
+        }]);
+      }
+
+      slicedChunks._fontFamily = pageChunks._fontFamily;
+
+      const tableStartIndex = await insertPageTable(token, docId, slicedChunks, {
+        cpLine, fSize, lSpacing, colGap, cellPadH, colWidthPt,
+        spacerWidthPt,
+        isFirstPage: isFirstTable,
+        metaJson: isFirstTable ? metaJson : null
+      });
+
+      if (isFirstTable) firstTableStartIndex = tableStartIndex;
+    }
   }
 
   return { success: true, tableStartIndex: firstTableStartIndex, numCols: chunks.length };
@@ -491,10 +542,9 @@ async function applyColumnJustify(docId, tableStartIndex, chunkIndices, resetMod
   for (const chunkIdx of chunkIndices) {
     if (chunkIdx < 0 || chunkIdx >= numCols) continue;
 
-    // このテーブルに含まれる列のみ処理
-    // chunkIdx=0 が右端列、chunkIdx=pageNumCols-1 が左端列
+    // このテーブルに含まれる列のみ（chunkIdx=0 が右端列＝col numPageCols）
     const contentColIdx = numCols - 1 - chunkIdx;
-    if (contentColIdx >= pageNumCols) continue; // このテーブルに存在しない列はスキップ
+    if (contentColIdx >= pageNumCols) continue;
 
     const displayCol = contentColIdx + (hasSpacerCol ? 1 : 0);
 
