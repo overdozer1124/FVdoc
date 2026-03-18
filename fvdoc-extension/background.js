@@ -419,19 +419,20 @@ async function handleInsert(docId, params) {
   const maxLinesPerPage = Math.max(1, Math.floor(usableHeightPt / lineHeightPt));
 
   // 水平方向の列数ページ分割
-  //   列幅合計 が ページ幅 × SCALE_TOLERANCE を超えたら分割が必要
-  //   SCALE_TOLERANCE=1.5 → 50%超過までは許容（Docsのスケーリングに任せる）
   //
-  //   分割する場合：1ページに収まる最大列数で切り分け（1ページ目を埋めてから2ページ目へ）
-  //   例) 46列・最大25列/page → 25 + 21
-  const SCALE_TOLERANCE   = 1.5;
+  //   Google Docs はテーブル列幅合計がページ幅を超えると全列を自動スケーリングする。
+  //   colGap=0 の場合：圧縮されても列間は元々0なので視覚的に問題なし → ~1.33倍まで許容
+  //   colGap>0 の場合：圧縮されると列間(colGap)も潰れて0になってしまう → 許容しない(1.0倍)
+  //
+  //   1.33 の根拠: colGap=0 で実測した際に Docs が許容できたスケーリング比率の上限
+  const SCALE_TOLERANCE   = (colGap > 0) ? 1.0 : 1.33;
   const totalContentWidth = chunks.length * colWidthPt;
   let   columnsPerPage;
   if (totalContentWidth <= usableWidthPt * SCALE_TOLERANCE) {
-    // Docsのスケーリングで収まる範囲 → 全列を1ページに
+    // スケーリング許容範囲内 → 全列を1ページに
     columnsPerPage = chunks.length;
   } else {
-    // スケーリング不可 → 1ページ最大列数で切り分け（ページを先に埋める）
+    // 許容超過 → 1ページ最大列数で切り分け（1ページ目を先に埋める）
     columnsPerPage = Math.max(1, Math.floor(usableWidthPt / colWidthPt));
   }
 
