@@ -405,10 +405,19 @@ async function handleInsert(docId, params) {
   const usableHeightPt = pageHeightPt - marginTopPt - marginBottomPt;
 
   // ページ幅（水平分割の判定に使用）
-  const pageWidthPt   = toPt(docStyle.pageSize?.width)  || 595;
-  const marginLeftPt  = toPt(docStyle.marginLeft)        || 72;
-  const marginRightPt = toPt(docStyle.marginRight)       || 72;
-  const usableWidthPt = pageWidthPt - marginLeftPt - marginRightPt;
+  const pageWidthPt     = toPt(docStyle.pageSize?.width)  || 595;
+  const marginLeftPt    = toPt(docStyle.marginLeft)        || 72;
+  const marginRightPt   = toPt(docStyle.marginRight)       || 72;
+  const rawUsableWidthPt = pageWidthPt - marginLeftPt - marginRightPt;
+  // 有効幅が異常に小さい場合（200pt未満 ≈ A5未満）はデフォルトマージン(各72pt)で再計算
+  const usableWidthPt   = (rawUsableWidthPt >= 200) ? rawUsableWidthPt : Math.max(200, pageWidthPt - 144);
+
+  // デバッグ: サービスワーカーのコンソールで確認可能
+  // chrome://extensions → FVdoc → 「Service Worker」リンク → Console タブ
+  console.log('[FVdoc] page:', {
+    pageWidthPt, marginLeftPt, marginRightPt,
+    rawUsableWidthPt, usableWidthPt
+  });
 
   // 列間(colGap)を反映: 各セル左右パディング = 1 + 列間/2 → 隣接列の間隔 = 列間
   const cellPadH   = 1 + colGap / 2;
@@ -501,7 +510,9 @@ async function handleInsert(docId, params) {
     }
   }
 
-  return { success: true, tableStartIndex: firstTableStartIndex, numCols: chunks.length };
+  console.log('[FVdoc] result:', { columnsPerPage, numPages: pageChunkGroups.length, numCols: chunks.length, usableWidthPt, colWidthPt });
+  return { success: true, tableStartIndex: firstTableStartIndex, numCols: chunks.length,
+    _debug: `usableW=${Math.round(usableWidthPt)}pt colW=${colWidthPt}pt cols/pg=${columnsPerPage} pages=${pageChunkGroups.length}` };
 }
 
 // ─── 均等割付 ─────────────────────────────────────────────────────
