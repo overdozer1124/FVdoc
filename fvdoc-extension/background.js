@@ -422,7 +422,7 @@ async function handleInsert(docId, params) {
 
   // デバッグ: サービスワーカーのコンソールで確認可能
   // chrome://extensions → FVdoc → 「Service Worker」リンク → Console タブ
-  console.log('[FVdoc] page:', {
+  console.log('[FVdoc v3] page:', {
     pageWidthPt, marginLeftPt, marginRightPt,
     rawUsableWidthPt, usableWidthPt
   });
@@ -505,7 +505,12 @@ async function handleInsert(docId, params) {
       const sliceHeightPt  = sliceLines * lineHeightPt;
 
       if (!isFirstTable) {
-        if (sliceHeightPt > remainingHeightPt) {
+        const willBreak = sliceHeightPt > remainingHeightPt;
+        console.log('[FVdoc v3] heightCheck:', {
+          pageIdx, sliceIdx, sliceLines, sliceHeightPt: Math.round(sliceHeightPt),
+          remainingHeightPt: Math.round(remainingHeightPt), willBreak
+        });
+        if (willBreak) {
           // 現在ページに収まらない → 改ページ（セクション区切り）
           const dBreak  = await docsGet(token, docId);
           const breakAt = dBreak.body.content[dBreak.body.content.length - 1].endIndex - 1;
@@ -536,7 +541,7 @@ async function handleInsert(docId, params) {
     }
   }
 
-  console.log('[FVdoc] result:', { columnsPerPage, numPages: pageChunkGroups.length, numCols: chunks.length, usableWidthPt, colWidthPt });
+  console.log('[FVdoc v3] result:', { columnsPerPage, numPages: pageChunkGroups.length, numCols: chunks.length, usableWidthPt, colWidthPt, usableHeightPt, lineHeightPt });
   return { success: true, tableStartIndex: firstTableStartIndex, numCols: chunks.length,
     _debug: `usableW=${Math.round(usableWidthPt)}pt colW=${colWidthPt}pt cols/pg=${columnsPerPage} pages=${pageChunkGroups.length}` };
 }
