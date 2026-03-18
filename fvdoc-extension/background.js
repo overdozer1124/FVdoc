@@ -422,9 +422,8 @@ async function handleInsert(docId, params) {
   //   列幅合計 が ページ幅 × SCALE_TOLERANCE を超えたら分割が必要
   //   SCALE_TOLERANCE=1.5 → 50%超過までは許容（Docsのスケーリングに任せる）
   //
-  //   分割する場合：必要ページ数を算出し、全ページで列数を均等配分する
-  //   例) 46列・最大25列/page → 2ページ → ceil(46/2)=23列ずつ（23+23）
-  //       単純に25+21にすると見た目が不均一になるため均等配分が望ましい
+  //   分割する場合：1ページに収まる最大列数で切り分け（1ページ目を埋めてから2ページ目へ）
+  //   例) 46列・最大25列/page → 25 + 21
   const SCALE_TOLERANCE   = 1.5;
   const totalContentWidth = chunks.length * colWidthPt;
   let   columnsPerPage;
@@ -432,10 +431,8 @@ async function handleInsert(docId, params) {
     // Docsのスケーリングで収まる範囲 → 全列を1ページに
     columnsPerPage = chunks.length;
   } else {
-    // スケーリング不可 → ページ分割（均等配分）
-    const maxColsPerPage = Math.max(1, Math.floor(usableWidthPt / colWidthPt)); // 1ページの上限
-    const numPages       = Math.ceil(chunks.length / maxColsPerPage);           // 必要ページ数
-    columnsPerPage       = Math.min(Math.ceil(chunks.length / numPages), maxColsPerPage);
+    // スケーリング不可 → 1ページ最大列数で切り分け（ページを先に埋める）
+    columnsPerPage = Math.max(1, Math.floor(usableWidthPt / colWidthPt));
   }
 
   // チャンクをページ単位に分割（超過の場合のみ複数グループ）
