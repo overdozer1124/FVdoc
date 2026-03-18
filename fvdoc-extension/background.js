@@ -422,7 +422,7 @@ async function handleInsert(docId, params) {
 
   // デバッグ: サービスワーカーのコンソールで確認可能
   // chrome://extensions → FVdoc → 「Service Worker」リンク → Console タブ
-  console.log('[FVdoc v3] page:', {
+  console.log('[FVdoc] page:', {
     pageWidthPt, marginLeftPt, marginRightPt,
     rawUsableWidthPt, usableWidthPt
   });
@@ -468,10 +468,18 @@ async function handleInsert(docId, params) {
 
   let firstTableStartIndex = null;
 
-  // 高さベースの改ページ管理:
-  //   remainingHeightPt = 現在ページの残り有効高さ
-  //   テーブルが収まる場合は同じページに続けて配置（セクション区切りなし）
-  //   収まらない場合のみ NEXT_PAGE セクション区切りを挿入して新ページへ
+  // ────────────────────────────────────────────────────────────────
+  // 改ページ規則（RULES.md に準拠）:
+  //
+  //   【水平ページグループ境界 (pageIdx > 0)】
+  //     → 常に NEXT_PAGE セクション区切りを挿入
+  //     → 各ページグループは独立した物理ページに配置
+  //     → ページ1を水平方向に埋め切ってから次ページへ（fill-first）
+  //
+  //   【高さスライス境界 (sliceIdx > 0)】
+  //     → 次スライスが残り有効高さを超える場合のみ NEXT_PAGE 挿入
+  //     → 収まる場合は同じページに続けて配置（高さ残量を消費）
+  // ────────────────────────────────────────────────────────────────
   let remainingHeightPt = usableHeightPt;
   let isFirstTable = true;
 
@@ -489,6 +497,19 @@ async function handleInsert(docId, params) {
       }
     }
 
+    // 水平ページグループが変わるとき: 常に改ページ
+    if (pageIdx > 0) {
+      const dBreak  = await docsGet(token, docId);
+      const breakAt = dBreak.body.content[dBreak.body.content.length - 1].endIndex - 1;
+      await batchUpdate(token, docId, [{
+        insertSectionBreak: {
+          location:    { index: breakAt },
+          sectionType: 'NEXT_PAGE'
+        }
+      }]);
+      remainingHeightPt = usableHeightPt; // 新ページの残り高さをリセット
+    }
+
     for (let sliceIdx = 0; sliceIdx < numHeightSlices; sliceIdx++) {
       const lineStart = sliceIdx * maxLinesPerPage;
       const lineEnd   = (sliceIdx === numHeightSlices - 1)
@@ -500,18 +521,19 @@ async function handleInsert(docId, params) {
       const hasContent = slicedChunks.some(c => c.length > 0);
       if (!hasContent) continue;
 
-      // このスライスのテーブル高さ（行数 × 行高さ）
-      const sliceLines     = lineEnd - lineStart;
-      const sliceHeightPt  = sliceLines * lineHeightPt;
+      const sliceLines    = lineEnd - lineStart;
+      const sliceHeightPt = sliceLines * lineHeightPt;
 
-      if (!isFirstTable) {
+      // 高さスライスが変わるとき: 残り高さに収まらない場合のみ改ページ
+      if (sliceIdx > 0) {
         const willBreak = sliceHeightPt > remainingHeightPt;
-        console.log('[FVdoc v3] heightCheck:', {
-          pageIdx, sliceIdx, sliceLines, sliceHeightPt: Math.round(sliceHeightPt),
-          remainingHeightPt: Math.round(remainingHeightPt), willBreak
+        console.log('[FVdoc v4] heightSlice:', {
+          pageIdx, sliceIdx, sliceLines,
+          sliceHeightPt: Math.round(sliceHeightPt),
+          remainingHeightPt: Math.round(remainingHeightPt),
+          willBreak
         });
         if (willBreak) {
-          // 現在ページに収まらない → 改ページ（セクション区切り）
           const dBreak  = await docsGet(token, docId);
           const breakAt = dBreak.body.content[dBreak.body.content.length - 1].endIndex - 1;
           await batchUpdate(token, docId, [{
@@ -520,9 +542,8 @@ async function handleInsert(docId, params) {
               sectionType: 'NEXT_PAGE'
             }
           }]);
-          remainingHeightPt = usableHeightPt; // 新ページの残り高さをリセット
+          remainingHeightPt = usableHeightPt;
         }
-        // 収まる場合はそのまま続けて配置（セクション区切りなし）
       }
 
       slicedChunks._fontFamily = pageChunks._fontFamily;
@@ -535,13 +556,11 @@ async function handleInsert(docId, params) {
 
       if (isFirstTable) firstTableStartIndex = tableStartIndex;
       isFirstTable = false;
-
-      // このテーブルを配置した後の残り高さを更新
       remainingHeightPt = Math.max(0, remainingHeightPt - sliceHeightPt);
     }
   }
 
-  console.log('[FVdoc v3] result:', { columnsPerPage, numPages: pageChunkGroups.length, numCols: chunks.length, usableWidthPt, colWidthPt, usableHeightPt, lineHeightPt });
+  console.log('[FVdoc v4] result:', { columnsPerPage, numPages: pageChunkGroups.length, numCols: chunks.length, usableWidthPt, colWidthPt, usableHeightPt, lineHeightPt });
   return { success: true, tableStartIndex: firstTableStartIndex, numCols: chunks.length,
     _debug: `usableW=${Math.round(usableWidthPt)}pt colW=${colWidthPt}pt cols/pg=${columnsPerPage} pages=${pageChunkGroups.length}` };
 }
