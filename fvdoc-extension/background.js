@@ -158,7 +158,7 @@ function buildChunks(text, charsPerLine) {
 // isFirstPage: true のときメタデータを col1 に挿入する
 // useEndOfSegment: true のとき文書末尾（改ページの後）に挿入（2ページ目以降で謎の空白を防ぐ）
 async function insertPageTable(token, docId, pageChunks, {
-  cpLine, fSize, lSpacing, colGap, cellPadH, colWidthPt,
+  cpLine, fSize, lSpacing, colGap, cellPadH, colWidthPt, usableWidthPt,
   isFirstPage, metaJson
 }) {
   const numPageCols   = pageChunks.length;
@@ -166,14 +166,22 @@ async function insertPageTable(token, docId, pageChunks, {
 
   const colMagnitude = Math.round(colWidthPt);
 
+  // スペーサー幅 = ページ有効幅 - コンテンツ列幅合計
+  // EVENLY_DISTRIBUTED は Google Docs が最小幅(~70pt)を強制するため FIXED_WIDTH に変更
+  // 最小5ptを確保（0/負になるのを防ぐ）
+  const spacerMagnitude = Math.max(5, Math.round(usableWidthPt) - numPageCols * colMagnitude);
+
   function makeColWidthReqs(tableStartIdx) {
-    // col0: EVENLY_DISTRIBUTED → ページ幅 - コンテンツ列幅合計 = 残り幅を自動吸収して右端揃え
+    // col0: FIXED_WIDTH = 計算済みスペーサー幅（右寄せ用）
     const reqs = [{
       updateTableColumnProperties: {
         tableStartLocation: { index: tableStartIdx },
         columnIndices: [0],
-        tableColumnProperties: { widthType: 'EVENLY_DISTRIBUTED' },
-        fields: 'widthType'
+        tableColumnProperties: {
+          widthType: 'FIXED_WIDTH',
+          width: { magnitude: spacerMagnitude, unit: 'PT' }
+        },
+        fields: 'width,widthType'
       }
     }];
     // col1〜: FIXED_WIDTH = fSize + 左右パディング（列間込み）
@@ -501,7 +509,7 @@ async function handleInsert(docId, params) {
       slicedChunks._fontFamily = pageChunks._fontFamily;
 
       const tableStartIndex = await insertPageTable(token, docId, slicedChunks, {
-        cpLine, fSize, lSpacing, colGap, cellPadH, colWidthPt,
+        cpLine, fSize, lSpacing, colGap, cellPadH, colWidthPt, usableWidthPt,
         isFirstPage: isFirstTable,
         metaJson: isFirstTable ? metaJson : null
       });
