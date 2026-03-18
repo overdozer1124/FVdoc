@@ -468,6 +468,13 @@ async function handleInsert(docId, params) {
 
   let firstTableStartIndex = null;
 
+  // 高さベースの改ページ管理:
+  //   remainingHeightPt = 現在ページの残り有効高さ
+  //   テーブルが収まる場合は同じページに続けて配置（セクション区切りなし）
+  //   収まらない場合のみ NEXT_PAGE セクション区切りを挿入して新ページへ
+  let remainingHeightPt = usableHeightPt;
+  let isFirstTable = true;
+
   for (let pageIdx = 0; pageIdx < pageChunkGroups.length; pageIdx++) {
     const pageChunks  = pageChunkGroups[pageIdx];
     const numPageCols = pageChunks.length;
@@ -493,17 +500,24 @@ async function handleInsert(docId, params) {
       const hasContent = slicedChunks.some(c => c.length > 0);
       if (!hasContent) continue;
 
-      const isFirstTable = pageIdx === 0 && sliceIdx === 0;
+      // このスライスのテーブル高さ（行数 × 行高さ）
+      const sliceLines     = lineEnd - lineStart;
+      const sliceHeightPt  = sliceLines * lineHeightPt;
 
-      if (pageIdx > 0 || sliceIdx > 0) {
-        const dBreak   = await docsGet(token, docId);
-        const breakAt  = dBreak.body.content[dBreak.body.content.length - 1].endIndex - 1;
-        await batchUpdate(token, docId, [{
-          insertSectionBreak: {
-            location:    { index: breakAt },
-            sectionType: 'NEXT_PAGE'
-          }
-        }]);
+      if (!isFirstTable) {
+        if (sliceHeightPt > remainingHeightPt) {
+          // 現在ページに収まらない → 改ページ（セクション区切り）
+          const dBreak  = await docsGet(token, docId);
+          const breakAt = dBreak.body.content[dBreak.body.content.length - 1].endIndex - 1;
+          await batchUpdate(token, docId, [{
+            insertSectionBreak: {
+              location:    { index: breakAt },
+              sectionType: 'NEXT_PAGE'
+            }
+          }]);
+          remainingHeightPt = usableHeightPt; // 新ページの残り高さをリセット
+        }
+        // 収まる場合はそのまま続けて配置（セクション区切りなし）
       }
 
       slicedChunks._fontFamily = pageChunks._fontFamily;
@@ -515,6 +529,10 @@ async function handleInsert(docId, params) {
       });
 
       if (isFirstTable) firstTableStartIndex = tableStartIndex;
+      isFirstTable = false;
+
+      // このテーブルを配置した後の残り高さを更新
+      remainingHeightPt = Math.max(0, remainingHeightPt - sliceHeightPt);
     }
   }
 
