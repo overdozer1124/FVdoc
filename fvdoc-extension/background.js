@@ -392,6 +392,55 @@ async function insertPageTable(token, docId, pageChunks, {
   return tableStartIndex;
 }
 
+// ─── 改ページ用不可視段落の挿入 ──────────────────────────────────
+// insertSectionBreak は空白ページを生成するため使用禁止。
+// 代わりに、ドキュメント末尾の trailing paragraph の直前に
+// pageBreakBefore=true / 1pt白字の不可視段落を挿入することで改ページを実現する。
+//
+// 動作:
+//   挿入前: [...TABLE_N, trailing_para]
+//   挿入後: [...TABLE_N, pbb_para(pageBreakBefore=true, 不可視), trailing_para]
+//   → trailing_para に挿入される TABLE_{N+1} はページ2以降に配置される
+async function insertPageBreakParagraph(token, docId) {
+  const doc    = await docsGet(token, docId);
+  const lastEl = doc.body.content[doc.body.content.length - 1];
+  const pbbIdx = lastEl.startIndex; // trailing_para の先頭に挿入
+  const white  = { color: { rgbColor: { red: 1, green: 1, blue: 1 } } };
+
+  // 1) '\n' を挿入して新しい段落を作る
+  await batchUpdate(token, docId, [{
+    insertText: { location: { index: pbbIdx }, text: '\n' }
+  }]);
+
+  // 2) その新しい段落（[pbbIdx, pbbIdx+1)）を不可視・pageBreakBefore に設定
+  await batchUpdate(token, docId, [
+    {
+      updateParagraphStyle: {
+        range: { startIndex: pbbIdx, endIndex: pbbIdx + 1 },
+        paragraphStyle: {
+          pageBreakBefore: true,
+          lineSpacing:  1,
+          spaceAbove:   { magnitude: 0, unit: 'PT' },
+          spaceBelow:   { magnitude: 0, unit: 'PT' }
+        },
+        fields: 'pageBreakBefore,lineSpacing,spaceAbove,spaceBelow'
+      }
+    },
+    {
+      updateTextStyle: {
+        range: { startIndex: pbbIdx, endIndex: pbbIdx + 1 },
+        textStyle: {
+          fontSize:        { magnitude: 1, unit: 'PT' },
+          foregroundColor: white
+        },
+        fields: 'fontSize,foregroundColor'
+      }
+    }
+  ]);
+
+  console.log('[FVdoc v4] pageBreak: PBB paragraph inserted at', pbbIdx);
+}
+
 // ─── メインロジック：テーブルの挿入（改ページ対応） ──────────────
 async function handleInsert(docId, params) {
   const { text, charsPerLine, fontSize, fontFamily, lineSpacingPct, colGapPt } = params;
@@ -498,16 +547,11 @@ async function handleInsert(docId, params) {
     }
 
     // 水平ページグループが変わるとき: 常に改ページ
+    // insertSectionBreak は空白ページを生成するバグがあるため、
+    // pageBreakBefore=true の不可視段落（1pt白字）を挿入して改ページを実現する
     if (pageIdx > 0) {
-      const dBreak  = await docsGet(token, docId);
-      const breakAt = dBreak.body.content[dBreak.body.content.length - 1].endIndex - 1;
-      await batchUpdate(token, docId, [{
-        insertSectionBreak: {
-          location:    { index: breakAt },
-          sectionType: 'NEXT_PAGE'
-        }
-      }]);
-      remainingHeightPt = usableHeightPt; // 新ページの残り高さをリセット
+      await insertPageBreakParagraph(token, docId);
+      remainingHeightPt = usableHeightPt;
     }
 
     for (let sliceIdx = 0; sliceIdx < numHeightSlices; sliceIdx++) {
@@ -534,14 +578,7 @@ async function handleInsert(docId, params) {
           willBreak
         });
         if (willBreak) {
-          const dBreak  = await docsGet(token, docId);
-          const breakAt = dBreak.body.content[dBreak.body.content.length - 1].endIndex - 1;
-          await batchUpdate(token, docId, [{
-            insertSectionBreak: {
-              location:    { index: breakAt },
-              sectionType: 'NEXT_PAGE'
-            }
-          }]);
+          await insertPageBreakParagraph(token, docId);
           remainingHeightPt = usableHeightPt;
         }
       }
