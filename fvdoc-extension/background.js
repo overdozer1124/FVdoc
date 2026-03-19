@@ -325,11 +325,10 @@ async function insertPageTable(token, docId, pageChunks, {
               paragraphStyle: {
                 alignment: 'CENTER',
                 lineSpacing,
-                spaceAbove:      { magnitude: 0, unit: 'PT' },
-                spaceBelow:      { magnitude: 0, unit: 'PT' },
-                pageBreakBefore: false  // pbb_para からの継承を防ぐ
+                spaceAbove: { magnitude: 0, unit: 'PT' },
+                spaceBelow: { magnitude: 0, unit: 'PT' }
               },
-              fields: 'alignment,lineSpacing,spaceAbove,spaceBelow,pageBreakBefore'
+              fields: 'alignment,lineSpacing,spaceAbove,spaceBelow'
             }
           });
 
@@ -362,12 +361,11 @@ async function insertPageTable(token, docId, pageChunks, {
             updateParagraphStyle: {
               range: { startIndex: contentEl.startIndex, endIndex: contentEl.endIndex },
               paragraphStyle: {
-                lineSpacing:     1,
-                spaceAbove:      { magnitude: 0, unit: 'PT' },
-                spaceBelow:      { magnitude: 0, unit: 'PT' },
-                pageBreakBefore: false  // pbb_para からの継承を防ぐ
+                lineSpacing:  1,
+                spaceAbove:   { magnitude: 0, unit: 'PT' },
+                spaceBelow:   { magnitude: 0, unit: 'PT' }
               },
-              fields: 'lineSpacing,spaceAbove,spaceBelow,pageBreakBefore'
+              fields: 'lineSpacing,spaceAbove,spaceBelow'
             }
           });
 
@@ -473,6 +471,67 @@ async function insertPageBreakParagraph(token, docId) {
   }));
   console.log('[FVdoc v4] PBB検証 (末尾3要素):', JSON.stringify(last3));
   console.log('[FVdoc v4] → pageBreakBefore が true であれば正常: pbbIdx=', pbbIdx);
+
+  return pbbIdx; // clearIntermediatePBB で使用
+}
+
+// ─── テーブル挿入後に自動生成段落の継承 pbb を除去 ───────────────
+// Google Docs は insertTable 時にテーブル直前に auto_para を自動生成することがある。
+// この auto_para が pbb_para の pageBreakBefore=true を継承すると余分な改ページが発生する。
+// → pbb_para(pbbIdx) と TABLE_2(tableStart) の間に存在する pbb=true 段落を除去する。
+async function clearIntermediatePBB(token, docId, pbbIdx, tableStart) {
+  const doc     = await docsGet(token, docId);
+  const content = doc.body.content;
+
+  // TABLE_2 直前の要素を特定してデバッグログ
+  const tableBodyIdx = content.findIndex(el => el.table && el.startIndex === tableStart);
+  const surroundingEls = content.slice(Math.max(0, tableBodyIdx - 2), tableBodyIdx + 1).map(el => ({
+    type:       el.table ? 'TABLE' : 'PARA',
+    startIndex: el.startIndex,
+    endIndex:   el.endIndex,
+    pbb:        el.paragraph?.paragraphStyle?.pageBreakBefore
+  }));
+  console.log('[FVdoc v4] TABLE_2 前後の要素:', JSON.stringify(surroundingEls));
+
+  // pbb_para(pbbIdx) とTABLE_2(tableStart) の間の段落で pbb=true のものを除去
+  const clearReqs = [];
+  const white = { color: { rgbColor: { red: 1, green: 1, blue: 1 } } };
+
+  for (const el of content) {
+    if (!el.paragraph) continue;
+    if (el.startIndex <= pbbIdx)   continue; // pbb_para 自体はスキップ
+    if (el.startIndex >= tableStart) break;  // TABLE_2 以降はスキップ
+
+    if (el.paragraph.paragraphStyle?.pageBreakBefore) {
+      console.log('[FVdoc v4] clearIntermediatePBB: auto_para の pbb=true を除去 at', el.startIndex);
+      clearReqs.push({
+        updateParagraphStyle: {
+          range: { startIndex: el.startIndex, endIndex: el.endIndex },
+          paragraphStyle: {
+            pageBreakBefore: false,
+            lineSpacing:  100,
+            spaceAbove:   { magnitude: 0, unit: 'PT' },
+            spaceBelow:   { magnitude: 0, unit: 'PT' }
+          },
+          fields: 'pageBreakBefore,lineSpacing,spaceAbove,spaceBelow'
+        }
+      });
+      clearReqs.push({
+        updateTextStyle: {
+          range: { startIndex: el.startIndex, endIndex: el.endIndex },
+          textStyle: { fontSize: { magnitude: 1, unit: 'PT' }, foregroundColor: white },
+          fields: 'fontSize,foregroundColor'
+        }
+      });
+    }
+  }
+
+  if (clearReqs.length > 0) {
+    await batchUpdate(token, docId, clearReqs);
+    console.log('[FVdoc v4] clearIntermediatePBB: 完了 (', clearReqs.length / 2, '段落をクリア)');
+  } else {
+    console.log('[FVdoc v4] clearIntermediatePBB: pbbIdx=', pbbIdx, '〜 tableStart=', tableStart, 'の間に継承 pbb なし');
+  }
 }
 
 // ─── メインロジック：テーブルの挿入（改ページ対応） ──────────────
@@ -580,11 +639,13 @@ async function handleInsert(docId, params) {
       }
     }
 
+    // pbbIdx: insertPageBreakParagraph が返す pbb_para の位置
+    // テーブル挿入後に clearIntermediatePBB で auto_para の継承 pbb を除去するために使用
+    let pbbIdx = null;
+
     // 水平ページグループが変わるとき: 常に改ページ
-    // insertSectionBreak は空白ページを生成するバグがあるため、
-    // pageBreakBefore=true の不可視段落（1pt白字）を挿入して改ページを実現する
     if (pageIdx > 0) {
-      await insertPageBreakParagraph(token, docId);
+      pbbIdx = await insertPageBreakParagraph(token, docId);
       remainingHeightPt = usableHeightPt;
     }
 
@@ -612,7 +673,7 @@ async function handleInsert(docId, params) {
           willBreak
         });
         if (willBreak) {
-          await insertPageBreakParagraph(token, docId);
+          pbbIdx = await insertPageBreakParagraph(token, docId);
           remainingHeightPt = usableHeightPt;
         }
       }
@@ -624,6 +685,13 @@ async function handleInsert(docId, params) {
         isFirstPage: isFirstTable,
         metaJson: isFirstTable ? metaJson : null
       });
+
+      // pbb_para 直後に Google Docs が auto_para を生成した場合、
+      // pbb=true が継承されて余分な改ページが発生するため、継承分を除去する
+      if (pbbIdx !== null) {
+        await clearIntermediatePBB(token, docId, pbbIdx, tableStartIndex);
+        pbbIdx = null;
+      }
 
       if (isFirstTable) firstTableStartIndex = tableStartIndex;
       isFirstTable = false;
