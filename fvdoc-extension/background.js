@@ -325,10 +325,11 @@ async function insertPageTable(token, docId, pageChunks, {
               paragraphStyle: {
                 alignment: 'CENTER',
                 lineSpacing,
-                spaceAbove: { magnitude: 0, unit: 'PT' },
-                spaceBelow: { magnitude: 0, unit: 'PT' }
+                spaceAbove:      { magnitude: 0, unit: 'PT' },
+                spaceBelow:      { magnitude: 0, unit: 'PT' },
+                pageBreakBefore: false  // pbb_para からの継承を防ぐ
               },
-              fields: 'alignment,lineSpacing,spaceAbove,spaceBelow'
+              fields: 'alignment,lineSpacing,spaceAbove,spaceBelow,pageBreakBefore'
             }
           });
 
@@ -361,11 +362,12 @@ async function insertPageTable(token, docId, pageChunks, {
             updateParagraphStyle: {
               range: { startIndex: contentEl.startIndex, endIndex: contentEl.endIndex },
               paragraphStyle: {
-                lineSpacing:  1,
-                spaceAbove:   { magnitude: 0, unit: 'PT' },
-                spaceBelow:   { magnitude: 0, unit: 'PT' }
+                lineSpacing:     1,
+                spaceAbove:      { magnitude: 0, unit: 'PT' },
+                spaceBelow:      { magnitude: 0, unit: 'PT' },
+                pageBreakBefore: false  // pbb_para からの継承を防ぐ
               },
-              fields: 'lineSpacing,spaceAbove,spaceBelow'
+              fields: 'lineSpacing,spaceAbove,spaceBelow,pageBreakBefore'
             }
           });
 
