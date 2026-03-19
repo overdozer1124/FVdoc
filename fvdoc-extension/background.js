@@ -20,6 +20,9 @@
 
 'use strict';
 
+// ★ バージョン確認用: chrome://extensions → FVdoc → Service Worker → Console で確認
+console.log('[FVdoc v4] ★★★ Service Worker 起動 ★★★', new Date().toISOString());
+
 const DOCS_API     = 'https://docs.googleapis.com/v1/documents';
 const FVDOC_MARKER = 'FVDOC_META:';
 
@@ -404,8 +407,27 @@ async function insertPageTable(token, docId, pageChunks, {
 async function insertPageBreakParagraph(token, docId) {
   const doc    = await docsGet(token, docId);
   const lastEl = doc.body.content[doc.body.content.length - 1];
+
+  // 安全チェック: 最後の要素が段落であることを確認
+  if (!lastEl.paragraph) {
+    console.error('[FVdoc v4] !! ERROR: lastEl is not a paragraph!', JSON.stringify({
+      type: lastEl.table ? 'TABLE' : 'OTHER',
+      startIndex: lastEl.startIndex,
+      endIndex: lastEl.endIndex
+    }));
+    throw new Error('insertPageBreakParagraph: lastEl is not a paragraph');
+  }
+
   const pbbIdx = lastEl.startIndex; // trailing_para の先頭に挿入
   const white  = { color: { rgbColor: { red: 1, green: 1, blue: 1 } } };
+
+  console.log('[FVdoc v4] PBB: 挿入前の末尾3要素:', JSON.stringify(
+    doc.body.content.slice(-3).map(el => ({
+      type: el.table ? 'TABLE' : 'PARA',
+      startIndex: el.startIndex,
+      endIndex:   el.endIndex
+    }))
+  ));
 
   // 1) '\n' を挿入して新しい段落を作る
   await batchUpdate(token, docId, [{
@@ -419,7 +441,7 @@ async function insertPageBreakParagraph(token, docId) {
         range: { startIndex: pbbIdx, endIndex: pbbIdx + 1 },
         paragraphStyle: {
           pageBreakBefore: true,
-          lineSpacing:  1,
+          lineSpacing:  100,
           spaceAbove:   { magnitude: 0, unit: 'PT' },
           spaceBelow:   { magnitude: 0, unit: 'PT' }
         },
@@ -438,7 +460,17 @@ async function insertPageBreakParagraph(token, docId) {
     }
   ]);
 
-  console.log('[FVdoc v4] pageBreak: PBB paragraph inserted at', pbbIdx);
+  // 検証: pageBreakBefore が正しく設定されたか確認
+  const verifyDoc = await docsGet(token, docId);
+  const verifyContent = verifyDoc.body.content;
+  const last3 = verifyContent.slice(-3).map(el => ({
+    type: el.table ? 'TABLE' : 'PARA',
+    startIndex: el.startIndex,
+    endIndex:   el.endIndex,
+    pbb: el.paragraph?.paragraphStyle?.pageBreakBefore
+  }));
+  console.log('[FVdoc v4] PBB検証 (末尾3要素):', JSON.stringify(last3));
+  console.log('[FVdoc v4] → pageBreakBefore が true であれば正常: pbbIdx=', pbbIdx);
 }
 
 // ─── メインロジック：テーブルの挿入（改ページ対応） ──────────────
