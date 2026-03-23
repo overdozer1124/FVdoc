@@ -127,11 +127,14 @@ function applyKinsoku(chunks) {
   const result = [...chunks];
   let i = 1;
   while (i < result.length) {
+    // 元から空のチャンク（空行由来）はスキップ：禁則処理対象外かつ削除しない
+    const originallyEmpty = result[i].length === 0;
     while (result[i].length > 0 && forbidden.has(result[i][0])) {
       result[i - 1] += result[i][0];
       result[i]      = result[i].substring(1);
     }
-    if (result[i].length === 0) {
+    // 禁則処理の結果として空になったチャンクだけ削除（空行由来の空チャンクは保持）
+    if (result[i].length === 0 && !originallyEmpty) {
       result.splice(i, 1);
     } else {
       i++;
@@ -142,9 +145,14 @@ function applyKinsoku(chunks) {
 
 // ─── 列チャンク構築 ───────────────────────────────────────────────
 function buildChunks(text, charsPerLine) {
-  const inputLines = text.split(/\r?\n/).filter(l => l.trim().length > 0);
+  const inputLines = text.split(/\r?\n/);
   const rawChunks = [];
   for (const line of inputLines) {
+    if (line.trim().length === 0) {
+      // 空行 → 空のチャンク（縦書きで1列空ける）
+      rawChunks.push('');
+      continue;
+    }
     const converted = replaceSymbols(line);
     if (!converted) continue;
     for (let i = 0; i < converted.length; i += charsPerLine) {
@@ -162,46 +170,47 @@ function buildChunks(text, charsPerLine) {
 // useEndOfSegment: true のとき文書末尾（改ページの後）に挿入（2ページ目以降で謎の空白を防ぐ）
 async function insertPageTable(token, docId, pageChunks, {
   cpLine, fSize, lSpacing, colGap, cellPadH, colWidthPt, usableWidthPt,
-  isFirstPage, metaJson
+  columnsPerPage, isFirstPage, metaJson
 }) {
   const numPageCols   = pageChunks.length;
-  const totalPageCols = numPageCols + 1; // col0 = スペーサー（左端・右寄せ用）
+  // totalPageCols = 常に columnsPerPage（ページ1と同じ列数）
+  // 先頭 numSpacerCols 列は空セル（右寄せ用スペーサー）、全列 EVENLY_DISTRIBUTED
+  // → Google Docs が usableWidthPt / columnsPerPage を全ページ均等に配分
+  const totalPageCols = columnsPerPage;
+  const numSpacerCols = totalPageCols - numPageCols;
 
-  const colMagnitude = Math.round(colWidthPt);
-
-  // スペーサー幅 = ページ有効幅 - コンテンツ列幅合計
-  // EVENLY_DISTRIBUTED は Google Docs が最小幅(~70pt)を強制するため FIXED_WIDTH に変更
-  // 最小5ptを確保（0/負になるのを防ぐ）
-  const spacerMagnitude = Math.max(5, Math.round(usableWidthPt) - numPageCols * colMagnitude);
+  console.log('[FVdoc] insertPageTable:', {
+    numPageCols, totalPageCols, numSpacerCols,
+    colWidthPt, usableWidthPt: Math.round(usableWidthPt),
+    estColWidth: Math.round(usableWidthPt / totalPageCols * 10) / 10
+  });
+  // ─────────────────────────────────────────────────────────────────────────────
 
   function makeColWidthReqs(tableStartIdx) {
-    // col0: FIXED_WIDTH = 計算済みスペーサー幅（右寄せ用）
-    const reqs = [{
+    // 全列 EVENLY_DISTRIBUTED: totalPageCols は常に columnsPerPage で一定
+    // → Google Docs が usableWidthPt を totalPageCols 等分
+    // → 全ページで列幅が一致し、FIXED_WIDTH によるオーバー/アンダー問題を完全回避
+    // 先頭 numSpacerCols 列は空セルで右寄せ効果（FIXED_WIDTH スペーサー不要）
+    const estColWidth = Math.round(usableWidthPt / totalPageCols * 10) / 10;
+    console.log('[FVdoc] makeColWidthReqs(ALL EVENLY_DISTRIBUTED): ' + JSON.stringify({
+      totalPageCols, numSpacerCols, numPageCols,
+      estColWidth,
+      usableWidthPt: Math.round(usableWidthPt)
+    }));
+
+    const allIndices = [];
+    for (let col = 0; col < totalPageCols; col++) allIndices.push(col);
+
+    return [{
       updateTableColumnProperties: {
         tableStartLocation: { index: tableStartIdx },
-        columnIndices: [0],
+        columnIndices: allIndices,
         tableColumnProperties: {
-          widthType: 'FIXED_WIDTH',
-          width: { magnitude: spacerMagnitude, unit: 'PT' }
+          widthType: 'EVENLY_DISTRIBUTED'
         },
-        fields: 'width,widthType'
+        fields: 'widthType'
       }
     }];
-    // col1〜: FIXED_WIDTH = fSize + 左右パディング（列間込み）
-    for (let col = 1; col < totalPageCols; col++) {
-      reqs.push({
-        updateTableColumnProperties: {
-          tableStartLocation: { index: tableStartIdx },
-          columnIndices: [col],
-          tableColumnProperties: {
-            widthType: 'FIXED_WIDTH',
-            width: { magnitude: colMagnitude, unit: 'PT' }
-          },
-          fields: 'width,widthType'
-        }
-      });
-    }
-    return reqs;
   }
 
   // ── 挿入位置を取得（endIndex - 1 = ドキュメント末尾の有効な最後のインデックス）
@@ -209,8 +218,52 @@ async function insertPageTable(token, docId, pageChunks, {
   const lastEl     = currentDoc.body.content[currentDoc.body.content.length - 1];
   const insertAt   = lastEl.endIndex - 1;
 
-  // ── テーブル挿入
-  await batchUpdate(token, docId, [{
+  // ── 挿入位置の段落インデントを診断（テーブル有効幅に影響する可能性がある）
+  try {
+    const ps = lastEl.paragraph?.paragraphStyle || {};
+    // namedStyles から NORMAL_TEXT の継承インデントも確認
+    const nsNormal = currentDoc.namedStyles?.styles?.find(s => s.namedStyleType === 'NORMAL_TEXT');
+    const nsIndent = nsNormal?.paragraphStyle?.indentStart ? toPt(nsNormal.paragraphStyle.indentStart) : null;
+    console.log('[FVdoc] 挿入段落スタイル: ' + JSON.stringify({
+      namedStyleType:  ps.namedStyleType,
+      indentStart:     ps.indentStart    ? toPt(ps.indentStart)    : null,
+      indentEnd:       ps.indentEnd      ? toPt(ps.indentEnd)      : null,
+      indentFirstLine: ps.indentFirstLine? toPt(ps.indentFirstLine): null,
+      namedStyleIndentStart: nsIndent,    // ← 継承インデント（null以外なら原因）
+      alignment:       ps.alignment,
+      insertAt,
+      lastElType: lastEl.paragraph ? 'PARA' : (lastEl.table ? 'TABLE' : 'OTHER')
+    }));
+  } catch (e) {
+    console.error('[FVdoc] 段落スタイル診断エラー:', e.message);
+  }
+
+  // ── 挿入前にインデント・段落行間をリセット（namedStyle 継承インデントを上書き）
+  // テーブルは段落の有効幅（ページ幅 − マージン − インデント）に制約されるため、
+  // インデントをゼロリセット。行間・前後スペースもゼロにして段落の高さを最小化する。
+  //
+  // ⚠️ updateTextStyle（fontSize/foregroundColor）はここで適用しない。
+  //    テーブル挿入前にカーソル位置の textStyle を変更すると、挿入後の新規セルが
+  //    その書式を継承してしまい（1pt 白文字）文字がすべて不可視になるため。
+  //    → テキストスタイルはテーブル挿入「後」に auto_para に適用する（下記参照）。
+  // ── 段落スタイルリセット ＋ テーブル挿入（1回の batchUpdate に統合）
+  const preInsertReqs = lastEl.paragraph ? [
+    {
+      updateParagraphStyle: {
+        range: { startIndex: insertAt, endIndex: insertAt + 1 },
+        paragraphStyle: {
+          indentStart:     { magnitude: 0, unit: 'PT' },
+          indentEnd:       { magnitude: 0, unit: 'PT' },
+          indentFirstLine: { magnitude: 0, unit: 'PT' },
+          lineSpacing:     100,
+          spaceAbove:      { magnitude: 0, unit: 'PT' },
+          spaceBelow:      { magnitude: 0, unit: 'PT' }
+        },
+        fields: 'indentStart,indentEnd,indentFirstLine,lineSpacing,spaceAbove,spaceBelow'
+      }
+    }
+  ] : [];
+  await batchUpdate(token, docId, [...preInsertReqs, {
     insertTable: {
       rows: 2,
       columns: totalPageCols,
@@ -225,16 +278,52 @@ async function insertPageTable(token, docId, pageChunks, {
   const newTable      = newTableEl.table;
   const newTableStart = newTableEl.startIndex;
 
-  // ── 列幅設定
-  await batchUpdate(token, docId, makeColWidthReqs(newTableStart));
+  // ── insertTable 直後の初期列幅を診断（updateTableColumnProperties 適用前）
+  try {
+    const initColProps = newTable.tableStyle?.tableColumnProperties || [];
+    const initMapped   = initColProps.map(p => ({ wt: p.widthType, mag: p.width?.magnitude, u: p.width?.unit }));
+    const initTotal    = initMapped.reduce((s, p) => s + (p.mag || 0), 0);
+    console.log('[FVdoc] 初期列幅(insertTable直後): ' + JSON.stringify({
+      numCols: initColProps.length,
+      totalInitial: Math.round(initTotal),
+      col0: initMapped[0] || null,
+      col1: initMapped[1] || null,
+      usableWidthPt: Math.round(usableWidthPt)
+    }));
+  } catch (e) {
+    console.error('[FVdoc] 初期列幅診断エラー:', e.message);
+  }
 
-  // ── テキスト挿入（col1=左端列 chunks[n-1] … col numPageCols=右端列 chunks[0]、右から左へ読む） ──
+  // ── 列幅設定 + テーブル前 auto_para の文字スタイルを最小化（1pt 白文字）
+  // ⚠️ updateTextStyle はテーブル挿入「後」に適用する。
+  //    挿入「前」に設定するとセルが書式を継承して文字がすべて不可視になる。
+  // auto_para はテーブル直前の 1文字（newline）なので範囲 = {newTableStart-1, newTableStart}
+  const autoParaWhite = { color: { rgbColor: { red: 1, green: 1, blue: 1 } } };
+  const autoParaTextStyleReqs = (newTableStart > 1) ? [{
+    updateTextStyle: {
+      range: { startIndex: newTableStart - 1, endIndex: newTableStart },
+      textStyle: {
+        fontSize:        { magnitude: 1, unit: 'PT' },
+        foregroundColor: autoParaWhite
+      },
+      fields: 'fontSize,foregroundColor'
+    }
+  }] : [];
+  await batchUpdate(token, docId, [...autoParaTextStyleReqs, ...makeColWidthReqs(newTableStart)]);
+
+  // ── テキスト挿入（col=numSpacerCols が左端コンテンツ列=最終チャンク、col=totalPageCols-1 が右端=最初チャンク）
+  // col 0〜numSpacerCols-1 は空スペーサー列（何も挿入しない）
   const insertions = [];
 
-  for (let col = 1; col < totalPageCols; col++) {
-    const contentColIdx = col - 1;
+  for (let col = numSpacerCols; col < totalPageCols; col++) {
+    const contentColIdx = col - numSpacerCols;
     const pageChunkIdx  = numPageCols - 1 - contentColIdx; // 右端=chunks[0] → 最後の列に
     const chunk         = pageChunks[pageChunkIdx];
+
+    // 空行由来の空チャンクはテキスト挿入をスキップ（insertText は空文字列不可）
+    // → セルは空のまま残り、縦書きレイアウトで1列分の空白として機能する
+    if (!chunk || chunk.length === 0) continue;
+
     const cellText      = chunk.split('').join('\n');
 
     const tableCell = newTable.tableRows[0].tableCells[col];
@@ -270,7 +359,7 @@ async function insertPageTable(token, docId, pageChunks, {
 
   for (let row = 0; row < 2; row++) {
     for (let col = 0; col < totalPageCols; col++) {
-      const isSpacerCol = (col === 0);
+      const isSpacerCol = (col < numSpacerCols);
       const tableCell   = styledTable.tableRows[row].tableCells[col];
 
       styleReqs.push({
@@ -299,146 +388,126 @@ async function insertPageTable(token, docId, pageChunks, {
       });
 
       if (row === 0 && !isSpacerCol) {
-        const contentColIdx = col - 1;
+        const contentColIdx = col - numSpacerCols;
         const pageChunkIdx  = numPageCols - 1 - contentColIdx;
         const chunkLen      = pageChunks[pageChunkIdx].length;
 
-        const paragraphs  = tableCell.content || [];
-        const lastParaIdx = paragraphs.length - 1;
-        let charIdx = 0;
+        const paragraphs = tableCell.content || [];
+        if (paragraphs.length === 0) continue;
 
-        for (let pi = 0; pi < paragraphs.length; pi++) {
-          const contentEl  = paragraphs[pi];
-          if (!contentEl.paragraph) continue;
+        // セル全体を1つの範囲として一括更新（1文字ごとの個別更新から変更）
+        // 全段落が同じスタイルを持つため、セル先頭〜末尾の範囲1つで適用可能。
+        // これにより styleReqs のリクエスト数を O(文字数) → O(1)/列 に削減。
+        const cellStart = paragraphs[0].startIndex;
+        const cellEnd   = paragraphs[paragraphs.length - 1].endIndex;
 
-          const paraStart  = contentEl.startIndex;
-          const paraEnd    = contentEl.endIndex;
-          const isTrailing = pi === lastParaIdx;
+        const lineSpacing = chunkLen > cpLine
+          ? Math.round(cpLine * lSpacing / chunkLen)
+          : lSpacing;
 
-          const lineSpacing = chunkLen > cpLine
-            ? Math.round(cpLine * lSpacing / chunkLen)
-            : lSpacing;
-
-          styleReqs.push({
-            updateParagraphStyle: {
-              range: { startIndex: paraStart, endIndex: paraEnd },
-              paragraphStyle: {
-                alignment: 'CENTER',
-                lineSpacing,
-                spaceAbove: { magnitude: 0, unit: 'PT' },
-                spaceBelow: { magnitude: 0, unit: 'PT' }
-              },
-              fields: 'alignment,lineSpacing,spaceAbove,spaceBelow'
-            }
-          });
-
-          for (const pe of contentEl.paragraph.elements || []) {
-            if (!pe.textRun) continue;
-            const textStyle = { fontSize: { magnitude: fSize, unit: 'PT' } };
-            let fields = 'fontSize';
-            if (pageChunks._fontFamily && pageChunks._fontFamily !== 'default') {
-              textStyle.weightedFontFamily = { fontFamily: pageChunks._fontFamily };
-              fields += ',weightedFontFamily';
-            }
-            styleReqs.push({
-              updateTextStyle: {
-                range: { startIndex: pe.startIndex, endIndex: pe.endIndex },
-                textStyle,
-                fields
-              }
-            });
+        styleReqs.push({
+          updateParagraphStyle: {
+            range: { startIndex: cellStart, endIndex: cellEnd },
+            paragraphStyle: {
+              alignment: 'CENTER',
+              lineSpacing,
+              spaceAbove: { magnitude: 0, unit: 'PT' },
+              spaceBelow: { magnitude: 0, unit: 'PT' }
+            },
+            fields: 'alignment,lineSpacing,spaceAbove,spaceBelow'
           }
+        });
 
-          if (!isTrailing) charIdx++;
+        const textStyle = { fontSize: { magnitude: fSize, unit: 'PT' } };
+        let tsFields = 'fontSize';
+        if (pageChunks._fontFamily && pageChunks._fontFamily !== 'default') {
+          textStyle.weightedFontFamily = { fontFamily: pageChunks._fontFamily };
+          tsFields += ',weightedFontFamily';
         }
+        styleReqs.push({
+          updateTextStyle: {
+            range: { startIndex: cellStart, endIndex: cellEnd },
+            textStyle,
+            fields: tsFields
+          }
+        });
 
       } else if (row === 1) {
-        // メタデータ行：1pt白文字・行間最小化
-        for (const contentEl of tableCell.content || []) {
-          if (!contentEl.paragraph) continue;
+        // メタデータ行：1pt白文字・行間最小化（セル全体を一括更新）
+        const paragraphs = tableCell.content || [];
+        if (paragraphs.length === 0) continue;
+        const cellStart = paragraphs[0].startIndex;
+        const cellEnd   = paragraphs[paragraphs.length - 1].endIndex;
 
-          styleReqs.push({
-            updateParagraphStyle: {
-              range: { startIndex: contentEl.startIndex, endIndex: contentEl.endIndex },
-              paragraphStyle: {
-                lineSpacing:  1,
-                spaceAbove:   { magnitude: 0, unit: 'PT' },
-                spaceBelow:   { magnitude: 0, unit: 'PT' }
-              },
-              fields: 'lineSpacing,spaceAbove,spaceBelow'
-            }
-          });
-
-          for (const pe of contentEl.paragraph?.elements || []) {
-            if (!pe.textRun) continue;
-            styleReqs.push({
-              updateTextStyle: {
-                range: { startIndex: pe.startIndex, endIndex: pe.endIndex },
-                textStyle: {
-                  fontSize:        { magnitude: 1, unit: 'PT' },
-                  foregroundColor: white
-                },
-                fields: 'fontSize,foregroundColor'
-              }
-            });
+        styleReqs.push({
+          updateParagraphStyle: {
+            range: { startIndex: cellStart, endIndex: cellEnd },
+            paragraphStyle: {
+              lineSpacing:  1,
+              spaceAbove:   { magnitude: 0, unit: 'PT' },
+              spaceBelow:   { magnitude: 0, unit: 'PT' }
+            },
+            fields: 'lineSpacing,spaceAbove,spaceBelow'
           }
-        }
+        });
+        styleReqs.push({
+          updateTextStyle: {
+            range: { startIndex: cellStart, endIndex: cellEnd },
+            textStyle: {
+              fontSize:        { magnitude: 1, unit: 'PT' },
+              foregroundColor: white
+            },
+            fields: 'fontSize,foregroundColor'
+          }
+        });
       }
     }
   }
 
-  await batchUpdate(token, docId, styleReqs);
-
-  // スタイル適用後に全列の幅を再適用（Docs が列幅を上書きすることがあるため、スペーサー含め確実に効かせる）
-  await batchUpdate(token, docId, makeColWidthReqs(tableStartIndex));
+  // スタイル適用 ＋ 列幅再適用を1回の batchUpdate に統合
+  // （テキストスタイル適用後に列幅が変化することがあるため末尾で列幅を確定）
+  await batchUpdate(token, docId, [...styleReqs, ...makeColWidthReqs(tableStartIndex)]);
+  // ────────────────────────────────────────────────────────────────────────────────────
 
   return tableStartIndex;
 }
 
-// ─── 改ページ用不可視段落の挿入 ──────────────────────────────────
-// insertSectionBreak は空白ページを生成するため使用禁止。
-// 代わりに、ドキュメント末尾の trailing paragraph の直前に
-// pageBreakBefore=true / 1pt白字の不可視段落を挿入することで改ページを実現する。
+// ─── テーブル直前の auto_para に pageBreakBefore=true を設定 ─────
+// Google Docs は insertTable 時にテーブル直前に auto_para を自動生成する。
+// この auto_para に pbb=true を設定することで、余分な段落を挿入せずに改ページを実現する。
 //
-// 動作:
-//   挿入前: [...TABLE_N, trailing_para]
-//   挿入後: [...TABLE_N, pbb_para(pageBreakBefore=true, 不可視), trailing_para]
-//   → trailing_para に挿入される TABLE_{N+1} はページ2以降に配置される
-async function insertPageBreakParagraph(token, docId) {
-  const doc    = await docsGet(token, docId);
-  const lastEl = doc.body.content[doc.body.content.length - 1];
+// 旧アプローチ（使用禁止）:
+//   pbb_para を先に挿入 → insertTable → auto_para が追加される
+//   結果: TABLE_N → pbb_para(pbb=true) → auto_para → TABLE_{N+1}
+//   問題: pbb_para と auto_para の2段落が空白ページを生成する
+//
+// 新アプローチ（このメソッド）:
+//   insertTable → auto_para を特定 → auto_para に pbb=true を設定
+//   結果: TABLE_N → auto_para(pbb=true) → TABLE_{N+1}
+//   1段落のみなので余分な空白ページが生成されない
+async function setPBBBeforeTable(token, docId, tableStartIndex) {
+  const doc     = await docsGet(token, docId);
+  const content = doc.body.content;
 
-  // 安全チェック: 最後の要素が段落であることを確認
-  if (!lastEl.paragraph) {
-    console.error('[FVdoc v4] !! ERROR: lastEl is not a paragraph!', JSON.stringify({
-      type: lastEl.table ? 'TABLE' : 'OTHER',
-      startIndex: lastEl.startIndex,
-      endIndex: lastEl.endIndex
-    }));
-    throw new Error('insertPageBreakParagraph: lastEl is not a paragraph');
+  const tableBodyIdx = content.findIndex(el => el.table && el.startIndex === tableStartIndex);
+  if (tableBodyIdx <= 0) {
+    console.error('[FVdoc v4] setPBBBeforeTable: テーブルが見つかりません (startIndex=', tableStartIndex, ')');
+    return;
   }
 
-  const pbbIdx = lastEl.startIndex; // trailing_para の先頭に挿入
-  const white  = { color: { rgbColor: { red: 1, green: 1, blue: 1 } } };
+  const prevEl = content[tableBodyIdx - 1];
+  if (!prevEl || !prevEl.paragraph) {
+    console.error('[FVdoc v4] setPBBBeforeTable: テーブル直前の段落が見つかりません', JSON.stringify({
+      tableBodyIdx, prevType: prevEl ? (prevEl.table ? 'TABLE' : 'OTHER') : 'null'
+    }));
+    return;
+  }
 
-  console.log('[FVdoc v4] PBB: 挿入前の末尾3要素:', JSON.stringify(
-    doc.body.content.slice(-3).map(el => ({
-      type: el.table ? 'TABLE' : 'PARA',
-      startIndex: el.startIndex,
-      endIndex:   el.endIndex
-    }))
-  ));
-
-  // 1) '\n' を挿入して新しい段落を作る
-  await batchUpdate(token, docId, [{
-    insertText: { location: { index: pbbIdx }, text: '\n' }
-  }]);
-
-  // 2) その新しい段落（[pbbIdx, pbbIdx+1)）を不可視・pageBreakBefore に設定
+  const white = { color: { rgbColor: { red: 1, green: 1, blue: 1 } } };
   await batchUpdate(token, docId, [
     {
       updateParagraphStyle: {
-        range: { startIndex: pbbIdx, endIndex: pbbIdx + 1 },
+        range: { startIndex: prevEl.startIndex, endIndex: prevEl.endIndex },
         paragraphStyle: {
           pageBreakBefore: true,
           lineSpacing:  100,
@@ -450,7 +519,7 @@ async function insertPageBreakParagraph(token, docId) {
     },
     {
       updateTextStyle: {
-        range: { startIndex: pbbIdx, endIndex: pbbIdx + 1 },
+        range: { startIndex: prevEl.startIndex, endIndex: prevEl.endIndex },
         textStyle: {
           fontSize:        { magnitude: 1, unit: 'PT' },
           foregroundColor: white
@@ -459,92 +528,16 @@ async function insertPageBreakParagraph(token, docId) {
       }
     }
   ]);
-
-  // 検証: pageBreakBefore が正しく設定されたか確認
-  const verifyDoc = await docsGet(token, docId);
-  const verifyContent = verifyDoc.body.content;
-  const last3 = verifyContent.slice(-3).map(el => ({
-    type: el.table ? 'TABLE' : 'PARA',
-    startIndex: el.startIndex,
-    endIndex:   el.endIndex,
-    pbb: el.paragraph?.paragraphStyle?.pageBreakBefore
-  }));
-  console.log('[FVdoc v4] PBB検証 (末尾3要素):', JSON.stringify(last3));
-  console.log('[FVdoc v4] → pageBreakBefore が true であれば正常: pbbIdx=', pbbIdx);
-
-  return pbbIdx; // clearIntermediatePBB で使用
-}
-
-// ─── テーブル挿入後に自動生成段落の継承 pbb を除去 ───────────────
-// Google Docs は insertTable 時にテーブル直前に auto_para を自動生成することがある。
-// この auto_para が pbb_para の pageBreakBefore=true を継承すると余分な改ページが発生する。
-// → pbb_para(pbbIdx) と TABLE_2(tableStart) の間に存在する pbb=true 段落を除去する。
-async function clearIntermediatePBB(token, docId, pbbIdx, tableStart) {
-  const doc     = await docsGet(token, docId);
-  const content = doc.body.content;
-
-  // TABLE_2 直前の要素を特定してデバッグログ
-  const tableBodyIdx = content.findIndex(el => el.table && el.startIndex === tableStart);
-  const surroundingEls = content.slice(Math.max(0, tableBodyIdx - 2), tableBodyIdx + 1).map(el => ({
-    type:       el.table ? 'TABLE' : 'PARA',
-    startIndex: el.startIndex,
-    endIndex:   el.endIndex,
-    pbb:        el.paragraph?.paragraphStyle?.pageBreakBefore
-  }));
-  console.log('[FVdoc v4] TABLE_2 前後の要素:', JSON.stringify(surroundingEls));
-
-  // pbb_para(pbbIdx) とTABLE_2(tableStart) の間の段落で pbb=true のものを除去
-  const clearReqs = [];
-  const white = { color: { rgbColor: { red: 1, green: 1, blue: 1 } } };
-
-  for (const el of content) {
-    if (!el.paragraph) continue;
-    if (el.startIndex <= pbbIdx)   continue; // pbb_para 自体はスキップ
-    if (el.startIndex >= tableStart) break;  // TABLE_2 以降はスキップ
-
-    if (el.paragraph.paragraphStyle?.pageBreakBefore) {
-      console.log('[FVdoc v4] clearIntermediatePBB: auto_para の pbb=true を除去 at', el.startIndex);
-      clearReqs.push({
-        updateParagraphStyle: {
-          range: { startIndex: el.startIndex, endIndex: el.endIndex },
-          paragraphStyle: {
-            pageBreakBefore: false,
-            lineSpacing:  100,
-            spaceAbove:   { magnitude: 0, unit: 'PT' },
-            spaceBelow:   { magnitude: 0, unit: 'PT' }
-          },
-          fields: 'pageBreakBefore,lineSpacing,spaceAbove,spaceBelow'
-        }
-      });
-      clearReqs.push({
-        updateTextStyle: {
-          range: { startIndex: el.startIndex, endIndex: el.endIndex },
-          textStyle: { fontSize: { magnitude: 1, unit: 'PT' }, foregroundColor: white },
-          fields: 'fontSize,foregroundColor'
-        }
-      });
-    }
-  }
-
-  if (clearReqs.length > 0) {
-    await batchUpdate(token, docId, clearReqs);
-    console.log('[FVdoc v4] clearIntermediatePBB: 完了 (', clearReqs.length / 2, '段落をクリア)');
-  } else {
-    console.log('[FVdoc v4] clearIntermediatePBB: pbbIdx=', pbbIdx, '〜 tableStart=', tableStart, 'の間に継承 pbb なし');
-  }
 }
 
 // ─── メインロジック：テーブルの挿入（改ページ対応） ──────────────
 async function handleInsert(docId, params) {
   const { text, charsPerLine, fontSize, fontFamily, lineSpacingPct, colGapPt } = params;
-  const cpLine   = parseInt(charsPerLine);
+  let   cpLine   = parseInt(charsPerLine);
   const fSize    = parseFloat(fontSize);
   const lSpacing = parseFloat(lineSpacingPct) || 70;
   const colGap   = parseFloat(colGapPt)       || 0;
   const token    = await getToken();
-
-  const chunks = buildChunks(text, cpLine);
-  if (!chunks.length) throw new Error('テキストがありません');
 
   // ── ページ寸法とスペーサー計算 ────────────────────────────────
   const doc            = await docsGet(token, docId);
@@ -553,6 +546,38 @@ async function handleInsert(docId, params) {
   const marginTopPt    = toPt(docStyle.marginTop)          || 72;
   const marginBottomPt = toPt(docStyle.marginBottom)       || 72;
   const usableHeightPt = pageHeightPt - marginTopPt - marginBottomPt;
+
+  // ── cpLine の上限をページ高さから自動計算してキャップ ──────────
+  //
+  // 【行高さの実測に基づく計算式】
+  // Google Docs の実際の1段落レンダリング高さは、フォントのメトリクスにより
+  // 「フォントサイズ × 約2倍」になることが実測で確認されている。
+  // （Noto Serif JP等のCJKフォントはフォントのascender/descenderが大きく、
+  //   lineSpacing=100(single spacing)でも行高≒fSize×2.0になる）
+  //
+  // lineSpacing < 100 はGoogle Docsでは最小値（100相当）として扱われるため、
+  // 実効的な行高 = fSize × 2.0 × max(lSpacing, 100) / 100
+  //
+  // 各セルは「本文 chunkLen 段落 + 末尾空段落 1 段落」の構成:
+  //   セル実高 = (chunkLen + 1) × lineHeightPt ≤ usableHeightPt
+  //   → chunkLen の上限 = floor(usableHeightPt / lineHeightPt) - 1
+  //
+  // フォントサイズを大きくすると1列の最大文字数が減る（物理的制約）。
+  // ユーザーの指定値がこの上限を超えている場合は自動的にキャップする。
+  {
+    const effectiveLSpacing  = Math.max(lSpacing, 100);
+    const lineHeightPtEst    = fSize * 2.0 * (effectiveLSpacing / 100);
+    const maxLinesPerPageEst = Math.max(1, Math.floor(usableHeightPt / lineHeightPtEst) - 1);
+    if (cpLine > maxLinesPerPageEst) {
+      console.log(`[FVdoc] cpLine 自動キャップ: ${cpLine}→${maxLinesPerPageEst}` +
+        ` (fSize=${fSize}, lSpacing=${lSpacing}→実効${effectiveLSpacing},` +
+        ` lineH=${lineHeightPtEst.toFixed(2)}pt, usableH=${usableHeightPt.toFixed(1)}pt)`);
+      cpLine = maxLinesPerPageEst;
+    }
+  }
+
+  const chunks = buildChunks(text, cpLine);
+  if (!chunks.length) throw new Error('テキストがありません');
 
   // ページ幅（水平分割の判定に使用）
   const pageWidthPt     = toPt(docStyle.pageSize?.width)  || 595;
@@ -569,31 +594,79 @@ async function handleInsert(docId, params) {
     rawUsableWidthPt, usableWidthPt
   });
 
-  // 列間(colGap)を反映: 各セル左右パディング = 1 + 列間/2 → 隣接列の間隔 = 列間
-  const cellPadH   = 1 + colGap / 2;
-  const colWidthPt = fSize + cellPadH * 2; // 1列の幅 = フォント幅 + 左右パディング（列間込み）
+  // ── セクションスタイル診断: documentStyle と実際のセクション余白・段組みを比較 ────
+  try {
+    const sections = doc.body?.content?.filter(el => el.sectionBreak) || [];
+    if (sections.length > 0) {
+      const secStyle    = sections[sections.length - 1].sectionBreak?.sectionStyle || {};
+      const secLeft     = toPt(secStyle.marginLeft);
+      const secRight    = toPt(secStyle.marginRight);
+      const secWidth    = toPt(secStyle.pageSize?.width);
+      const colProps    = secStyle.columnProperties || [];
+      // columnProperties が 2件以上 = 多段組みレイアウト（テーブル幅が制限される！）
+      const colWidths   = colProps.map(c => ({ w: toPt(c.width), pad: toPt(c.paddingEnd) }));
+      const colCount    = colProps.length;
+      console.log('[FVdoc] sectionStyle: ' + JSON.stringify({
+        secLeft, secRight, secWidth,
+        secUsable: (secWidth || pageWidthPt) - (secLeft || marginLeftPt) - (secRight || marginRightPt),
+        multiColumnCount: colCount,       // 2以上なら多段組み → テーブル幅が 1/N に制限
+        columnWidths:     colWidths,      // 各段の幅（存在する場合）
+        equalColumnsBool: secStyle.equalColumns
+      }));
+    } else {
+      console.log('[FVdoc] sectionStyle: セクション区切りなし（documentStyle のみ）');
+    }
+  } catch (e) {
+    console.error('[FVdoc] sectionStyle 診断エラー:', e.message);
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // 列間(colGap)を反映: 各セル左右パディング = 列間/2 → 隣接列間の視覚的隙間 = 列間
+  //   colWidthPt = fSize + colGap  （文字幅 + 列間 = 1列が水平に占める幅）
+  //   cellPadH   = colGap / 2      （隙間を左右のセルに均等分割）
+  //   columnsPerPage は colWidthPt から導出される（列間設定が先、列数は結果）
+  const cellPadH   = colGap / 2;
+  const colWidthPt = fSize + cellPadH * 2; // = fSize + colGap
 
   // 1ページに収まる行数（縦書きセル内の「行」＝1文字＝1段落の高さ）
-  const lineHeightPt    = fSize * (lSpacing / 100);
-  const maxLinesPerPage = Math.max(1, Math.floor(usableHeightPt / lineHeightPt));
+  //
+  // 各セルは「本文 chunkLen 段落 + 末尾空段落 1 段落」の構成になっており、
+  // セルの実際の高さ = (chunkLen + 1) × lineHeightPt。
+  // そのため chunkLen の上限は floor(usableHeightPt / lineHeightPt) - 1 とする必要がある。
+  //
+  // lineHeightPt: 実測により Google Docs の実際の行高 = fSize × 2.0 × max(lSpacing,100)/100
+  // （上部の cpLine キャップと同じ式を使用して一貫性を保つ）
+  const lineHeightPt    = fSize * 2.0 * (Math.max(lSpacing, 100) / 100);
+  const maxLinesPerPage = Math.max(1, Math.floor(usableHeightPt / lineHeightPt) - 1);
 
   // 水平方向の列数ページ分割
   //
-  //   Google Docs はテーブル列幅合計がページ幅を超えると全列を自動スケーリングする。
-  //   colGap=0 の場合：圧縮されても列間は元々0なので視覚的に問題なし → ~1.33倍まで許容
-  //   colGap>0 の場合：圧縮されると列間(colGap)も潰れて0になってしまう → 許容しない(1.0倍)
+  //   Google Docs はテーブル列幅合計がページ幅を超えると全列を比例スケーリングする。
+  //   RULES.md Section 1-3 の設計: columnsPerPage = floor(usableWidthPt / colWidthPt)
   //
-  //   1.33 の根拠: colGap=0 で実測した際に Docs が許容できたスケーリング比率の上限
+  //   colGap=0 の場合：スケーリング許容（~1.33倍まで） → 全列を1ページに収める
+  //   colGap>0 の場合：スケーリング不可（列間が潰れる） → 1ページあたり上記式で分割
   const SCALE_TOLERANCE   = (colGap > 0) ? 1.0 : 1.33;
   const totalContentWidth = chunks.length * colWidthPt;
-  let   columnsPerPage;
+
+  const colMagnitude = Math.round(colWidthPt);  // insertPageTable でも同値を使用
+
+  let columnsPerPage;
   if (totalContentWidth <= usableWidthPt * SCALE_TOLERANCE) {
     // スケーリング許容範囲内 → 全列を1ページに
     columnsPerPage = chunks.length;
   } else {
-    // 許容超過 → 1ページ最大列数で切り分け（1ページ目を先に埋める）
-    columnsPerPage = Math.max(1, Math.floor(usableWidthPt / colWidthPt));
+    // RULES.md Section 1-3: floor(usableWidthPt / colWidthPt)
+    // → ページ1の合計がわずかに usableWidthPt を超えることで Docs 比例縮小が発動し
+    //   テーブルがページ幅いっぱいにレンダリングされる（原則1・2の設計的意図）
+    columnsPerPage = Math.max(1, Math.floor(Math.round(usableWidthPt) / colMagnitude));
   }
+
+  console.log('[FVdoc] columnsPerPage:', {
+    colWidthPt, colMagnitude, usableWidthPt: Math.round(usableWidthPt),
+    formula: `floor(${Math.round(usableWidthPt)}/${colMagnitude}) = ${columnsPerPage}`,
+    totalPerPage: columnsPerPage * colMagnitude + Math.max(5, Math.round(usableWidthPt) - columnsPerPage * colMagnitude)
+  });
 
   // チャンクをページ単位に分割（超過の場合のみ複数グループ）
   const pageChunkGroups = [];
@@ -614,13 +687,19 @@ async function handleInsert(docId, params) {
   // 改ページ規則（RULES.md に準拠）:
   //
   //   【水平ページグループ境界 (pageIdx > 0)】
-  //     → 常に NEXT_PAGE セクション区切りを挿入
+  //     → needsPageBreak=true を設定し、テーブル挿入後に setPBBBeforeTable で
+  //       auto_para(テーブル直前の段落)に pageBreakBefore=true を適用する
   //     → 各ページグループは独立した物理ページに配置
   //     → ページ1を水平方向に埋め切ってから次ページへ（fill-first）
   //
   //   【高さスライス境界 (sliceIdx > 0)】
-  //     → 次スライスが残り有効高さを超える場合のみ NEXT_PAGE 挿入
+  //     → 次スライスが残り有効高さを超える場合のみ needsPageBreak=true を設定
   //     → 収まる場合は同じページに続けて配置（高さ残量を消費）
+  //
+  //   【改ページ実現の仕組み】
+  //     insertTable 時に Google Docs が TABLE 直前に auto_para を自動生成する。
+  //     この auto_para に pbb=true を設定することで、余分な段落挿入なしに改ページを実現。
+  //     （旧: insertPageBreakParagraph で pbb_para を先行挿入 → auto_para と2段落になり空白ページが発生）
   // ────────────────────────────────────────────────────────────────
   let remainingHeightPt = usableHeightPt;
   let isFirstTable = true;
@@ -639,13 +718,13 @@ async function handleInsert(docId, params) {
       }
     }
 
-    // pbbIdx: insertPageBreakParagraph が返す pbb_para の位置
-    // テーブル挿入後に clearIntermediatePBB で auto_para の継承 pbb を除去するために使用
-    let pbbIdx = null;
+    // needsPageBreak: 次のテーブル挿入後に setPBBBeforeTable を呼び出すフラグ
+    // （テーブル挿入前に pbb_para を挿入すると空白ページが発生するため、挿入後に auto_para へ設定する）
+    let needsPageBreak = false;
 
     // 水平ページグループが変わるとき: 常に改ページ
     if (pageIdx > 0) {
-      pbbIdx = await insertPageBreakParagraph(token, docId);
+      needsPageBreak = true;
       remainingHeightPt = usableHeightPt;
     }
 
@@ -673,7 +752,7 @@ async function handleInsert(docId, params) {
           willBreak
         });
         if (willBreak) {
-          pbbIdx = await insertPageBreakParagraph(token, docId);
+          needsPageBreak = true;
           remainingHeightPt = usableHeightPt;
         }
       }
@@ -682,15 +761,15 @@ async function handleInsert(docId, params) {
 
       const tableStartIndex = await insertPageTable(token, docId, slicedChunks, {
         cpLine, fSize, lSpacing, colGap, cellPadH, colWidthPt, usableWidthPt,
+        columnsPerPage,
         isFirstPage: isFirstTable,
         metaJson: isFirstTable ? metaJson : null
       });
 
-      // pbb_para 直後に Google Docs が auto_para を生成した場合、
-      // pbb=true が継承されて余分な改ページが発生するため、継承分を除去する
-      if (pbbIdx !== null) {
-        await clearIntermediatePBB(token, docId, pbbIdx, tableStartIndex);
-        pbbIdx = null;
+      // テーブル挿入後に auto_para へ pbb=true を設定（余分な段落挿入を回避）
+      if (needsPageBreak) {
+        await setPBBBeforeTable(token, docId, tableStartIndex);
+        needsPageBreak = false;
       }
 
       if (isFirstTable) firstTableStartIndex = tableStartIndex;
